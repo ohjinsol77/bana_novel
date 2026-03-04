@@ -117,7 +117,7 @@ router.get('/me', (req, res) => {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token || token === 'null' || token === 'undefined') {
         // Guest mode fallback
-        return res.json({ id: 1, role: 'admin', name: 'Guest' });
+        return res.json({ id: 1, role: 'admin', name: '손님' });
     }
     try {
         const payload = jwt.verify(token, process.env.JWT_SECRET);

@@ -305,6 +305,116 @@ textarea.input-control {
   line-height: 1.6;
 }
 
+.character-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.character-section {
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 14px;
+  padding: 1rem;
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.section-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.85rem;
+}
+
+.section-title {
+  font-size: 0.98rem;
+  color: var(--text-main);
+  margin-bottom: 0.85rem;
+}
+
+.section-title-row .section-title {
+  margin-bottom: 0;
+}
+
+.section-limit {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+.field-grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.field-grid-two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.selection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 0.65rem;
+}
+
+.choice-chip {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-height: 48px;
+  padding: 0.7rem 0.85rem;
+  border-radius: 12px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-surface);
+  color: var(--text-main);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, transform 0.15s;
+}
+
+.choice-chip:hover {
+  border-color: rgba(124, 92, 252, 0.4);
+  transform: translateY(-1px);
+}
+
+.choice-chip.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.choice-chip input {
+  margin: 0;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
+.choice-chip span {
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.input-help {
+  margin-top: 0.55rem;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+
+.text-counter {
+  margin-top: 0.45rem;
+  text-align: right;
+  color: var(--text-muted);
+  font-size: 0.78rem;
+}
+
+@media (max-width: 700px) {
+  .field-grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .selection-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ── Chat Layout ───────────────────────────────────────── */
 .chat-layout {
   display: flex;

@@ -53,7 +53,7 @@ export async function deleteStory(id: number) {
 }
 
 export async function updateStorySettings(id: number, viewer_settings: any) {
-    const res = await fetch(`${BASE}/stories/${id}/settings`, {
+    const res = await fetch(`${BASE}/stories/settings/${id}`, {
         method: 'PUT', headers: authHeaders(), body: JSON.stringify({ viewer_settings })
     });
     if (!res.ok) {

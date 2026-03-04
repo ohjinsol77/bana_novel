@@ -1,14 +1,25 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import pool from '../db.js';
+import { hydrateCharacterRow, serializeCharacterPayload } from '../persona.js';
 
 const router = express.Router();
+
+function parseJsonField(value, fallback = null) {
+    if (!value) return fallback;
+    if (typeof value === 'object') return value;
+    try {
+        return JSON.parse(value);
+    } catch {
+        return fallback;
+    }
+}
 
 function auth(req, res, next) {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token || token === 'null' || token === 'undefined') {
         // Guest mode fallback
-        req.user = { id: 1, role: 'admin', name: 'Guest' };
+        req.user = { id: 1, role: 'admin', name: '손님' };
         return next();
     }
     try {
@@ -16,6 +27,27 @@ function auth(req, res, next) {
         next();
     } catch {
         res.status(401).json({ error: '토큰 만료' });
+    }
+}
+
+async function updateStorySettingsHandler(req, res) {
+    try {
+        const storyId = req.params.id;
+        const { viewer_settings } = req.body;
+
+        // 권한 체크
+        const [check] = await pool.query('SELECT id FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
+        if (!check.length) return res.status(403).json({ error: '권한이 없습니다.' });
+
+        await pool.query(
+            'UPDATE stories SET viewer_settings=? WHERE id=? AND user_id=?',
+            [JSON.stringify(viewer_settings), storyId, req.user.id]
+        );
+
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('Error updating story settings:', err);
+        res.status(500).json({ error: '설정 저장 실패: ' + err.message });
     }
 }
 
@@ -30,7 +62,8 @@ router.get('/', auth, async (req, res) => {
         // 붙어있는 등장인물 정보까지 같이 가져오기 (초기 로드를 위해)
         for (let story of stories) {
             const [chars] = await pool.query('SELECT * FROM story_characters WHERE story_id=?', [story.id]);
-            story.characters = chars;
+            story.characters = chars.map(hydrateCharacterRow);
+            story.viewer_settings = parseJsonField(story.viewer_settings, null);
         }
 
         res.json(stories);
@@ -48,7 +81,8 @@ router.get('/:id', auth, async (req, res) => {
 
         const story = stories[0];
         const [chars] = await pool.query('SELECT * FROM story_characters WHERE story_id=?', [story.id]);
-        story.characters = chars;
+        story.characters = chars.map(hydrateCharacterRow);
+        story.viewer_settings = parseJsonField(story.viewer_settings, null);
 
         res.json(story);
     } catch (err) {
@@ -79,11 +113,12 @@ router.post('/', auth, async (req, res) => {
         // 2. 등장인물들 생성
         if (characters && characters.length > 0) {
             for (const char of characters) {
-                if (!char.name) throw new Error('등장인물의 이름이 누락되었습니다.');
+                const { name, personaJson } = serializeCharacterPayload(char);
+                if (!name) throw new Error('등장인물의 이름이 누락되었습니다.');
                 await conn.query(
-                    `INSERT INTO story_characters (story_id, name, personality, appearance, habits, avatar_url)
-                     VALUES (?, ?, ?, ?, ?, ?)`,
-                    [storyId, char.name, char.personality || '', char.appearance || '', char.habits || '', char.avatar_url || '']
+                    `INSERT INTO story_characters (story_id, name, persona_json)
+                     VALUES (?, ?, ?)`,
+                    [storyId, name, personaJson]
                 );
             }
         }
@@ -94,7 +129,8 @@ router.post('/', auth, async (req, res) => {
         const [rows] = await conn.query('SELECT * FROM stories WHERE id=?', [storyId]);
         const story = rows[0];
         const [chars] = await conn.query('SELECT * FROM story_characters WHERE story_id=?', [storyId]);
-        story.characters = chars;
+        story.characters = chars.map(hydrateCharacterRow);
+        story.viewer_settings = parseJsonField(story.viewer_settings, null);
 
         res.json(story);
     } catch (err) {
@@ -105,6 +141,10 @@ router.post('/', auth, async (req, res) => {
         conn.release();
     }
 });
+
+// ── 이야기 설정(뷰어설정)만 개별 업데이트 ────────────────────
+router.put('/settings/:id', auth, updateStorySettingsHandler);
+router.put('/:id/settings', auth, updateStorySettingsHandler);
 
 // ── 이야기 수정 (등장인물 포함) ─────────────────────────────
 router.put('/:id', auth, async (req, res) => {
@@ -132,10 +172,12 @@ router.put('/:id', auth, async (req, res) => {
 
         if (characters && characters.length > 0) {
             for (const char of characters) {
+                const { name, personaJson } = serializeCharacterPayload(char);
+                if (!name) throw new Error('등장인물의 이름이 누락되었습니다.');
                 await conn.query(
-                    `INSERT INTO story_characters (story_id, name, personality, appearance, habits, avatar_url)
-                     VALUES (?, ?, ?, ?, ?, ?)`,
-                    [storyId, char.name, char.personality || '', char.appearance || '', char.habits || '', char.avatar_url || '']
+                    `INSERT INTO story_characters (story_id, name, persona_json)
+                     VALUES (?, ?, ?)`,
+                    [storyId, name, personaJson]
                 );
             }
         }
@@ -145,7 +187,8 @@ router.put('/:id', auth, async (req, res) => {
         const [rows] = await conn.query('SELECT * FROM stories WHERE id=?', [storyId]);
         const story = rows[0];
         const [chars] = await conn.query('SELECT * FROM story_characters WHERE story_id=?', [storyId]);
-        story.characters = chars;
+        story.characters = chars.map(hydrateCharacterRow);
+        story.viewer_settings = parseJsonField(story.viewer_settings, null);
 
         res.json(story);
     } catch (err) {
@@ -154,28 +197,6 @@ router.put('/:id', auth, async (req, res) => {
         res.status(500).json({ error: '수정 실패: ' + err.message });
     } finally {
         conn.release();
-    }
-});
-
-// ── 이야기 설정(뷰어설정)만 개별 업데이트 ────────────────────
-router.put('/:id/settings', auth, async (req, res) => {
-    try {
-        const storyId = req.params.id;
-        const { viewer_settings } = req.body;
-
-        // 권한 체크
-        const [check] = await pool.query('SELECT id FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
-        if (!check.length) return res.status(403).json({ error: '권한이 없습니다.' });
-
-        await pool.query(
-            'UPDATE stories SET viewer_settings=? WHERE id=? AND user_id=?',
-            [JSON.stringify(viewer_settings), storyId, req.user.id]
-        );
-
-        res.json({ ok: true });
-    } catch (err) {
-        console.error('Error updating story settings:', err);
-        res.status(500).json({ error: '설정 저장 실패: ' + err.message });
     }
 });
 

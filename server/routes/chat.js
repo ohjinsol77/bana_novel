@@ -1,21 +1,50 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import pool from '../db.js';
+import { appendFile, mkdir } from 'fs/promises';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { formatCharacterPersona, hydrateCharacterRow } from '../persona.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 dotenv.config({ path: join(__dirname, '../.env') });
 
 const router = express.Router();
+const GEMINI_FAILURE_MESSAGE = '(AI 집필에 실패했습니다. 연결을 확인하세요.)';
+const GEMINI_ERROR_LOG_DIR = join(__dirname, '../logs');
+const GEMINI_ERROR_LOG_PATH = join(GEMINI_ERROR_LOG_DIR, 'gemini-errors.log');
+const CHAT_DEBUG_LOG_PATH = join(GEMINI_ERROR_LOG_DIR, 'chat-debug.log');
+
+async function appendLogFile(filePath, details) {
+    const logEntry = [
+        `=== ${new Date().toISOString()} ===`,
+        JSON.stringify(details, null, 2),
+        '',
+    ].join('\n');
+
+    try {
+        await mkdir(GEMINI_ERROR_LOG_DIR, { recursive: true });
+        await appendFile(filePath, logEntry, 'utf8');
+    } catch (logErr) {
+        console.error('Gemini log write failed:', logErr);
+    }
+}
+
+async function writeGeminiErrorLog(details) {
+    await appendLogFile(GEMINI_ERROR_LOG_PATH, details);
+}
+
+async function writeChatDebugLog(details) {
+    await appendLogFile(CHAT_DEBUG_LOG_PATH, details);
+}
 
 function auth(req, res, next) {
     const token = req.headers.authorization?.split(' ')[1];
     if (!token || token === 'null' || token === 'undefined') {
         // Guest mode fallback: use ID 1 (Admin/Seed user)
-        req.user = { id: 1, role: 'admin', name: 'Guest' };
+        req.user = { id: 1, role: 'admin', name: '손님' };
         return next();
     }
     try {
@@ -49,14 +78,28 @@ router.post('/:storyId', auth, async (req, res) => {
         if (!content?.trim()) return res.status(400).json({ error: '내용 없음' });
 
         const storyId = req.params.storyId;
+        await writeChatDebugLog({
+            event: 'chat_request_received',
+            storyId,
+            userId: req.user.id,
+            contentPreview: String(content).slice(0, 120),
+        });
 
         // 1. 스토리 정보 가져오기
         const [stories] = await pool.query('SELECT * FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
-        if (!stories.length) return res.status(404).json({ error: '이야기를 찾을 수 없거나 권한이 없습니다.' });
+        if (!stories.length) {
+            await writeChatDebugLog({
+                event: 'chat_story_not_found',
+                storyId,
+                userId: req.user.id,
+            });
+            return res.status(404).json({ error: '이야기를 찾을 수 없거나 권한이 없습니다.' });
+        }
         const story = stories[0];
 
         // 2. 스토리 내 등장인물 목록 모두 가져오기
-        const [characters] = await pool.query('SELECT * FROM story_characters WHERE story_id=?', [storyId]);
+        const [characterRows] = await pool.query('SELECT * FROM story_characters WHERE story_id=?', [storyId]);
+        const characters = characterRows.map(hydrateCharacterRow);
 
         // 사용자의 턴 기록 저장
         await pool.query(
@@ -72,6 +115,7 @@ router.post('/:storyId', auth, async (req, res) => {
             try {
                 // 작가용 시스템 프롬프트 구성
                 const systemPrompt = buildWriterPrompt(story, characters);
+                const modelName = 'gemini-2.5-flash';
 
                 // 최근 문맥 가져오기
                 const [history] = await pool.query(
@@ -87,7 +131,7 @@ router.post('/:storyId', auth, async (req, res) => {
                 }));
 
                 const response = await fetch(
-                    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+                    `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`,
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -98,15 +142,88 @@ router.post('/:storyId', auth, async (req, res) => {
                         })
                     }
                 );
-                const data = await response.json();
-                aiReply = data.candidates?.[0]?.content?.parts?.[0]?.text || '(AI 집필에 실패했습니다. 연결을 확인하세요.)';
+                const rawBody = await response.text();
+                let data = null;
+
+                try {
+                    data = rawBody ? JSON.parse(rawBody) : null;
+                } catch {
+                    data = null;
+                }
+
+                await writeChatDebugLog({
+                    event: 'gemini_response_received',
+                    storyId,
+                    userId: req.user.id,
+                    model: modelName,
+                    status: response.status,
+                    statusText: response.statusText,
+                    hasCandidates: Boolean(data?.candidates?.length),
+                    hasError: Boolean(data?.error),
+                });
+
+                if (!response.ok) {
+                    const errorDetails = {
+                        model: modelName,
+                        storyId,
+                        userId: req.user.id,
+                        status: response.status,
+                        statusText: response.statusText,
+                        error: data?.error || null,
+                        promptFeedback: data?.promptFeedback || null,
+                        body: data || rawBody,
+                    };
+                    console.error('Gemini API Error:', errorDetails);
+                    await writeGeminiErrorLog(errorDetails);
+                    aiReply = GEMINI_FAILURE_MESSAGE;
+                } else {
+                    const generatedText = data?.candidates?.[0]?.content?.parts
+                        ?.map((part) => part?.text || '')
+                        .join('')
+                        .trim();
+
+                    if (!generatedText) {
+                        const errorDetails = {
+                            model: modelName,
+                            storyId,
+                            userId: req.user.id,
+                            promptFeedback: data?.promptFeedback || null,
+                            candidates: data?.candidates || null,
+                            body: data || rawBody,
+                        };
+                        console.error('Gemini API Empty Candidate:', errorDetails);
+                        await writeGeminiErrorLog(errorDetails);
+                        aiReply = GEMINI_FAILURE_MESSAGE;
+                    } else {
+                        aiReply = generatedText;
+                        await writeChatDebugLog({
+                            event: 'gemini_response_success',
+                            storyId,
+                            userId: req.user.id,
+                            model: modelName,
+                            outputLength: generatedText.length,
+                        });
+                    }
+                }
             } catch (e) {
                 console.error("Gemini Error:", e);
-                aiReply = `[오류] Gemini API 호출 실패: ${e.message}`;
+                await writeGeminiErrorLog({
+                    model: 'gemini-2.5-flash',
+                    storyId,
+                    userId: req.user.id,
+                    exception: e?.message || String(e),
+                    stack: e?.stack || null,
+                });
+                aiReply = GEMINI_FAILURE_MESSAGE;
             }
         } else {
             // Mock 응답
             aiReply = `(AI 작가 모의 응답) 입력하신 "${content}" 에 이어서, [${characters.map(c => c.name).join(', ')}] 인물들이 얽힌 다음 단락을 이어나갑니다. GEMINI API 키를 설정해주세요.`;
+            await writeChatDebugLog({
+                event: 'gemini_mock_response',
+                storyId,
+                userId: req.user.id,
+            });
         }
 
         // AI 생성 문단 저장
@@ -115,9 +232,23 @@ router.post('/:storyId', auth, async (req, res) => {
             [storyId, req.user.id, 'assistant', aiReply]
         );
 
+        await writeChatDebugLog({
+            event: 'chat_response_saved',
+            storyId,
+            userId: req.user.id,
+            isFailureMessage: aiReply === GEMINI_FAILURE_MESSAGE,
+        });
+
         res.json({ role: 'assistant', content: aiReply });
     } catch (err) {
         console.error('Error writing story:', err);
+        await writeChatDebugLog({
+            event: 'chat_route_exception',
+            storyId: req.params.storyId,
+            userId: req.user?.id || null,
+            error: err?.message || String(err),
+            stack: err?.stack || null,
+        });
         res.status(500).json({ error: '집필 전송 실패' });
     }
 });
@@ -149,10 +280,7 @@ function buildWriterPrompt(story, characters) {
 `;
 
     characters.forEach((c, i) => {
-        prompt += `\n[인물 ${i + 1}: ${c.name}]
-- 성격: ${c.personality || '미설정'}
-- 외모: ${c.appearance || '미설정'}
-- 습관/특징: ${c.habits || '미설정'}\n`;
+        prompt += `\n[페르소나 ${i + 1}]\n${formatCharacterPersona(c)}\n`;
     });
 
     prompt += `

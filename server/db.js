@@ -50,6 +50,7 @@ export async function initDB() {
                 title           VARCHAR(200) NOT NULL,
                 background      TEXT,
                 environment     TEXT,
+                viewer_settings LONGTEXT,
                 is_public       TINYINT(1) DEFAULT 0,
                 created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -63,6 +64,7 @@ export async function initDB() {
                 id              INT AUTO_INCREMENT PRIMARY KEY,
                 story_id        INT NOT NULL,
                 name            VARCHAR(100) NOT NULL,
+                persona_json    LONGTEXT,
                 personality     TEXT,
                 appearance      TEXT,
                 habits          TEXT,
@@ -71,6 +73,68 @@ export async function initDB() {
                 FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `);
+
+        const [viewerSettingsColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'viewer_settings'
+            LIMIT 1
+        `);
+        if (!viewerSettingsColumns.length) {
+            await conn.query('ALTER TABLE stories ADD COLUMN viewer_settings LONGTEXT NULL AFTER environment;');
+        }
+
+        const [personaJsonColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'story_characters'
+              AND column_name = 'persona_json'
+            LIMIT 1
+        `);
+        if (!personaJsonColumns.length) {
+            await conn.query('ALTER TABLE story_characters ADD COLUMN persona_json LONGTEXT NULL AFTER name;');
+        }
+
+        const [legacyCharacters] = await conn.query(`
+            SELECT id, name, personality, appearance, habits
+            FROM story_characters
+            WHERE persona_json IS NULL OR persona_json = ''
+        `);
+
+        for (const character of legacyCharacters) {
+            const legacyBackground = [
+                character.personality ? `이전 성격 메모: ${character.personality}` : '',
+                character.appearance ? `이전 외관 메모: ${character.appearance}` : '',
+                character.habits ? `이전 특징 메모: ${character.habits}` : '',
+            ].filter(Boolean).join('\n').slice(0, 1500);
+
+            const personaJson = JSON.stringify({
+                name: character.name || '',
+                age: null,
+                gender: 'other',
+                job: '',
+                residence: '',
+                personality: [],
+                speechStyles: [],
+                behaviorRules: [],
+                customBehaviorRules: '',
+                likes: [],
+                dislikes: [],
+                customDislikes: '',
+                relationship: 'friend',
+                goals: [],
+                customGoals: '',
+                background: legacyBackground,
+            });
+
+            await conn.query(
+                'UPDATE story_characters SET persona_json=? WHERE id=?',
+                [personaJson, character.id]
+            );
+        }
 
         // 소설 집필 목록 테이블
         await conn.query(`
