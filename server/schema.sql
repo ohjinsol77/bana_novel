@@ -14,29 +14,46 @@ CREATE TABLE IF NOT EXISTS users (
     UNIQUE KEY uniq_oauth (oauth_id, provider)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS characters (
+-- 이전 테이블 삭제 (초기화)
+DROP TABLE IF EXISTS chat_messages;
+DROP TABLE IF EXISTS characters;
+
+-- 이야기(Story) 테이블 생성
+CREATE TABLE IF NOT EXISTS stories (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     user_id         INT NOT NULL,
-    name            VARCHAR(100) NOT NULL,
-    persona         TEXT,
-    greeting        TEXT,
+    title           VARCHAR(200) NOT NULL,
     background      TEXT,
     environment     TEXT,
-    avatar_url      VARCHAR(512),
+    viewer_settings JSON,
     is_public       TINYINT(1) DEFAULT 0,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS chat_messages (
+-- 이야기 內 등장인물 테이블 (최대 7명 권장)
+CREATE TABLE IF NOT EXISTS story_characters (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    story_id        INT NOT NULL,
+    name            VARCHAR(100) NOT NULL,
+    personality     TEXT,
+    appearance      TEXT,
+    habits          TEXT,
+    avatar_url      VARCHAR(512),
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 소설 집필(채팅/작성) 기록 테이블
+CREATE TABLE IF NOT EXISTS story_messages (
     id             INT AUTO_INCREMENT PRIMARY KEY,
-    character_id   INT NOT NULL,
+    story_id       INT NOT NULL,
     user_id        INT NOT NULL,
     role           ENUM('user','assistant') NOT NULL,
     content        TEXT NOT NULL,
     created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (character_id) REFERENCES characters(id) ON DELETE CASCADE
+    FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 관리자 계정 시드

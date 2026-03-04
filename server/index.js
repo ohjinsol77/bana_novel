@@ -11,7 +11,7 @@ dotenv.config({ path: join(__dirname, '.env') });
 
 import { initDB } from './db.js';
 import authRouter, { passport } from './routes/auth.js';
-import charactersRouter from './routes/characters.js';
+import storiesRouter from './routes/stories.js';
 import chatRouter from './routes/chat.js';
 
 const app = express();
@@ -42,7 +42,7 @@ passport.deserializeUser((user, done) => done(null, user));
 
 // ── Routes ──────────────────────────────────────────────────
 app.use('/api/auth', authRouter);
-app.use('/api/characters', charactersRouter);
+app.use('/api/stories', storiesRouter);
 app.use('/api/chat', chatRouter);
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));

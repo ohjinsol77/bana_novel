@@ -16,18 +16,18 @@ export async function fetchMe() {
     return res.json();
 }
 
-// ── Characters ──────────────────────────────────────────────
-export async function fetchCharacters() {
-    const res = await fetch(`${BASE}/characters`, { headers: authHeaders() });
+// ── Stories ─────────────────────────────────────────────────
+export async function fetchStories() {
+    const res = await fetch(`${BASE}/stories`, { headers: authHeaders() });
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || `캐릭터 목록을 가져올 수 없습니다 (${res.status})`);
+        throw new Error(errData.error || `이야기 목록을 가져올 수 없습니다 (${res.status})`);
     }
     return res.json();
 }
 
-export async function createCharacter(data: object) {
-    const res = await fetch(`${BASE}/characters`, {
+export async function createStory(data: object) {
+    const res = await fetch(`${BASE}/stories`, {
         method: 'POST', headers: authHeaders(), body: JSON.stringify(data)
     });
     if (!res.ok) {
@@ -37,8 +37,8 @@ export async function createCharacter(data: object) {
     return res.json();
 }
 
-export async function updateCharacter(id: number, data: object) {
-    const res = await fetch(`${BASE}/characters/${id}`, {
+export async function updateStory(id: number, data: object) {
+    const res = await fetch(`${BASE}/stories/${id}`, {
         method: 'PUT', headers: authHeaders(), body: JSON.stringify(data)
     });
     if (!res.ok) {
@@ -48,13 +48,24 @@ export async function updateCharacter(id: number, data: object) {
     return res.json();
 }
 
-export async function deleteCharacter(id: number) {
-    await fetch(`${BASE}/characters/${id}`, { method: 'DELETE', headers: authHeaders() });
+export async function deleteStory(id: number) {
+    await fetch(`${BASE}/stories/${id}`, { method: 'DELETE', headers: authHeaders() });
 }
 
-// ── Chat ────────────────────────────────────────────────────
-export async function fetchChatHistory(characterId: number) {
-    const res = await fetch(`${BASE}/chat/${characterId}`, { headers: authHeaders() });
+export async function updateStorySettings(id: number, viewer_settings: any) {
+    const res = await fetch(`${BASE}/stories/${id}/settings`, {
+        method: 'PUT', headers: authHeaders(), body: JSON.stringify({ viewer_settings })
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `서버 오류 (${res.status})`);
+    }
+    return res.json();
+}
+
+// ── Story Messages (Writing) ───────────────────────────────────
+export async function fetchStoryMessages(storyId: number) {
+    const res = await fetch(`${BASE}/chat/${storyId}`, { headers: authHeaders() });
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || `대화 내역을 가져올 수 없습니다 (${res.status})`);
@@ -62,19 +73,19 @@ export async function fetchChatHistory(characterId: number) {
     return res.json();
 }
 
-export async function sendMessage(characterId: number, content: string) {
-    const res = await fetch(`${BASE}/chat/${characterId}`, {
+export async function sendStoryMessage(storyId: number, content: string) {
+    const res = await fetch(`${BASE}/chat/${storyId}`, {
         method: 'POST', headers: authHeaders(), body: JSON.stringify({ content })
     });
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || `메시지 전송 실패 (${res.status})`);
+        throw new Error(errData.error || `집필 전송 실패 (${res.status})`);
     }
     return res.json();
 }
 
-export async function clearChat(characterId: number) {
-    await fetch(`${BASE}/chat/${characterId}/clear`, { method: 'DELETE', headers: authHeaders() });
+export async function clearStoryMessages(storyId: number) {
+    await fetch(`${BASE}/chat/${storyId}/clear`, { method: 'DELETE', headers: authHeaders() });
 }
 
 // ── Admin ───────────────────────────────────────────────────

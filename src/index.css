@@ -527,10 +527,26 @@ textarea.input-control {
   aspect-ratio: 16/9;
 }
 
+.book-pages.ratio-full {
+  max-width: 100%;
+  width: 100%;
+  height: 100%;
+  border-radius: 4px;
+}
+
 .book-pages.ratio-tall {
   max-width: 500px;
   height: 90vh;
   border-radius: 20px;
+}
+
+.character-name-highlight {
+  color: var(--accent);
+  font-weight: 700;
+  border-bottom: 2px solid var(--accent-soft);
+  padding: 0 2px;
+  border-radius: 4px;
+  background: var(--accent-soft);
 }
 
 .book-pages.ratio-tall::after {
@@ -591,8 +607,19 @@ textarea.input-control {
 }
 
 .book-pages.has-background-inner {
-  background: linear-gradient(rgba(240, 236, 226, 0.9), rgba(240, 236, 226, 0.9)),
+  background: linear-gradient(rgba(240, 236, 226, 0.4), rgba(240, 236, 226, 0.4)),
     url('https://images.unsplash.com/photo-1541961017774-22349e4a1262?auto=format&fit=crop&q=80&w=1400') center/cover;
+}
+
+.book-pages.has-background-inner .book-text-container,
+.book-pages.has-background-inner .book-text-tall {
+  background: rgba(255, 255, 255, 0.7);
+  backdrop-filter: blur(2px);
+  border-radius: 8px;
+  box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
+  margin: 2rem;
+  height: calc(100% - 4rem);
+  padding: 2rem 3rem !important;
 }
 
 .book-nav-btn {

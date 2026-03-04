@@ -38,17 +38,18 @@ export async function initDB() {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `);
 
-        // 캐릭터 테이블
+        // 기존 테이블 삭제 (환경 초기화 시)
+        await conn.query('DROP TABLE IF EXISTS chat_messages;');
+        await conn.query('DROP TABLE IF EXISTS characters;');
+
+        // 이야기(Story) 테이블
         await conn.query(`
-            CREATE TABLE IF NOT EXISTS characters (
+            CREATE TABLE IF NOT EXISTS stories (
                 id              INT AUTO_INCREMENT PRIMARY KEY,
                 user_id         INT NOT NULL,
-                name            VARCHAR(100) NOT NULL,
-                persona         TEXT,
-                greeting        TEXT,
+                title           VARCHAR(200) NOT NULL,
                 background      TEXT,
                 environment     TEXT,
-                avatar_url      VARCHAR(512),
                 is_public       TINYINT(1) DEFAULT 0,
                 created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -56,16 +57,31 @@ export async function initDB() {
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `);
 
-        // 대화 기록 테이블
+        // 이야기 內 등장인물 테이블
         await conn.query(`
-            CREATE TABLE IF NOT EXISTS chat_messages (
+            CREATE TABLE IF NOT EXISTS story_characters (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                story_id        INT NOT NULL,
+                name            VARCHAR(100) NOT NULL,
+                personality     TEXT,
+                appearance      TEXT,
+                habits          TEXT,
+                avatar_url      VARCHAR(512),
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+
+        // 소설 집필 목록 테이블
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS story_messages (
                 id             INT AUTO_INCREMENT PRIMARY KEY,
-                character_id   INT NOT NULL,
+                story_id       INT NOT NULL,
                 user_id        INT NOT NULL,
                 role           ENUM('user','assistant') NOT NULL,
                 content        TEXT NOT NULL,
                 created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (character_id) REFERENCES characters(id) ON DELETE CASCADE
+                FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `);
 
