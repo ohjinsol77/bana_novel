@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  app:
+    # Docker Hub에 올려둔 이미지를 다운받아 사용합니다.
+    image: ohjinsol/auction-alert:latest
+    container_name: auction-alert-app
+    ports:
+      - "4000:4000"
+      - "5174:5174"
+    volumes:
+      - .:/app
+      - /app/node_modules
+    environment:
+      # Docker Compose 내부에서 MySQL 컨테이너로 연결되도록 설정합니다.
+      - DB_HOST=db
+      - DB_PORT=3306
+      - DB_USER=${DB_USER:-novel}
+      - DB_PASSWORD=${DB_PASSWORD:-Password1!}
+      - DB_NAME=${DB_NAME:-novelai_db}
+      # Windows/Mac 환경 파일 변경 폴링 (Hot-reload 지원용)
+      - CHOKIDAR_USEPOLLING=true
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: mysql:8.4.5
+    container_name: auction-alert-db
+    environment:
+      - MYSQL_ROOT_PASSWORD=${DB_PASSWORD:-Password1!}
+      - MYSQL_DATABASE=${DB_NAME:-novelai_db}
+      - MYSQL_USER=${DB_USER:-novel}
+      - MYSQL_PASSWORD=${DB_PASSWORD:-Password1!}
+    ports:
+      - "3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+      # 최초 실행 시 schema.sql을 이용해 자동 테이블 생성
+      - ./server/schema.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: [ "CMD", "mysqladmin", "ping", "-h", "localhost" ]
+      timeout: 20s
+      retries: 10
+
+volumes:
+  db_data:
