@@ -315,7 +315,7 @@ export default function App() {
         <nav className="top-nav">
             <div className="nav-brand" onClick={() => view !== 'login' && navigate('home')}>
                 <BookOpen size={24} className="text-accent" />
-                <span>Novel<span className="text-accent">AI</span></span>
+                <span>Bana<span className="text-accent">Novel 🍌</span></span>
             </div>
             {user && (
                 <div className="nav-actions">
@@ -428,8 +428,8 @@ export default function App() {
     // ── Studio: story & character creation/edit ──────────────────────
     const renderStudio = () => {
         const handleAddCharacter = () => {
-            if (form.characters && form.characters.length >= 7) {
-                alert('등장인물은 최대 7명까지만 가능합니다.');
+            if (form.characters && form.characters.length >= 5) {
+                alert('등장인물은 최대 5명까지만 가능합니다.');
                 return;
             }
             setForm(prev => ({

@@ -52,7 +52,7 @@ async function start() {
     try {
         await initDB();
         app.listen(PORT, () => {
-            console.log(`\n🚀 NovelAI 백엔드 서버 실행 중: http://localhost:${PORT}`);
+            console.log(`\n🚀 Bana Novel 🍌 백엔드 서버 실행 중: http://localhost:${PORT}`);
             console.log(`📋 헬스체크: http://localhost:${PORT}/health\n`);
         });
     } catch (err) {
