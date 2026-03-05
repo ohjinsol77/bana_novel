@@ -411,7 +411,18 @@ export default function App() {
     };
 
     const handleSend = async () => {
-        if (!msgInput.trim() || !activeStory || isSending) return;
+        const trimmed = msgInput.trim();
+        if (!trimmed || !activeStory || isSending) {
+            console.warn('집필 요청 차단:', {
+                hasInput: Boolean(trimmed),
+                activeStoryId: activeStory?.id ?? null,
+                isSending,
+            });
+            if (!activeStory) {
+                alert('이야기를 먼저 열어주세요.');
+            }
+            return;
+        }
         const content = msgInput;
         const userMessageId = Date.now();
         setMsgInput('');
@@ -419,7 +430,9 @@ export default function App() {
         setStoryMessages(prev => [...prev, { id: userMessageId, story_id: activeStory.id, role: 'user', content, created_at: '' }]);
 
         try {
+            console.info('집필 요청 시작:', { storyId: activeStory.id, contentLength: content.length });
             const reply = await sendStoryMessage(activeStory.id, content);
+            console.info('집필 요청 완료:', { storyId: activeStory.id, hasReply: Boolean(reply?.content) });
             setStoryMessages(prev => [...prev, { id: reply.id ?? Date.now() + 1, story_id: activeStory.id, role: 'assistant', content: reply.content, created_at: '' }]);
         } catch (err: any) {
             console.error('집필 전송 실패:', err);

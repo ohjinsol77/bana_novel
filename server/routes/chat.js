@@ -13,7 +13,7 @@ dotenv.config({ path: join(__dirname, '../.env') });
 
 const router = express.Router();
 const GEMINI_FAILURE_MESSAGE = '(AI 집필에 실패했습니다. 연결을 확인하세요.)';
-const GEMINI_ERROR_LOG_DIR = join(__dirname, '../logs');
+const GEMINI_ERROR_LOG_DIR = process.env.GEMINI_LOG_DIR || join(process.cwd(), 'server', 'logs');
 const GEMINI_ERROR_LOG_PATH = join(GEMINI_ERROR_LOG_DIR, 'gemini-errors.log');
 const CHAT_DEBUG_LOG_PATH = join(GEMINI_ERROR_LOG_DIR, 'chat-debug.log');
 
@@ -28,7 +28,11 @@ async function appendLogFile(filePath, details) {
         await mkdir(GEMINI_ERROR_LOG_DIR, { recursive: true });
         await appendFile(filePath, logEntry, 'utf8');
     } catch (logErr) {
-        console.error('Gemini log write failed:', logErr);
+        console.error('Gemini log write failed:', {
+            path: filePath,
+            baseDir: GEMINI_ERROR_LOG_DIR,
+            error: logErr?.message || String(logErr),
+        });
     }
 }
 
@@ -112,34 +116,57 @@ router.post('/:storyId', auth, async (req, res) => {
         const geminiKey = process.env.GEMINI_API_KEY;
 
         if (geminiKey && geminiKey !== 'your_gemini_api_key_here') {
+            // 작가용 시스템 프롬프트 구성
+            const systemPrompt = buildWriterPrompt(story, characters);
+            const modelName = 'gemini-2.5-flash';
+
+            // 최근 문맥 가져오기
+            const [history] = await pool.query(
+                `SELECT role, content FROM story_messages
+                 WHERE story_id=? AND user_id=?
+                 ORDER BY created_at DESC LIMIT 30`,
+                [storyId, req.user.id]
+            );
+
+            const reversedHistory = history.reverse();
+            const filteredHistory = reversedHistory.filter((msg) => {
+                if (msg.role !== 'assistant') return true;
+                const text = String(msg.content || '').trim();
+                if (!text) return false;
+                if (text === GEMINI_FAILURE_MESSAGE) return false;
+                if (text.startsWith('[오류]')) return false;
+                if (text.startsWith('(AI 작가 모의 응답)')) return false;
+                return true;
+            });
+
+            const historyForModel = filteredHistory.length ? filteredHistory : [{ role: 'user', content }];
+            const messages = historyForModel.map(m => ({
+                role: m.role === 'user' ? 'user' : 'model',
+                parts: [{ text: m.content }]
+            }));
+
+            await writeChatDebugLog({
+                event: 'gemini_history_filtered',
+                storyId,
+                userId: req.user.id,
+                rawHistoryCount: reversedHistory.length,
+                usedHistoryCount: messages.length,
+                droppedCount: reversedHistory.length - filteredHistory.length,
+            });
+
             try {
-                // 작가용 시스템 프롬프트 구성
-                const systemPrompt = buildWriterPrompt(story, characters);
-                const modelName = 'gemini-2.5-flash';
-
-                // 최근 문맥 가져오기
-                const [history] = await pool.query(
-                    `SELECT role, content FROM story_messages
-                     WHERE story_id=? AND user_id=?
-                     ORDER BY created_at DESC LIMIT 30`,
-                    [storyId, req.user.id]
-                );
-
-                const messages = history.reverse().map(m => ({
-                    role: m.role === 'user' ? 'user' : 'model',
-                    parts: [{ text: m.content }]
-                }));
+                const requestBody = {
+                    system_instruction: { parts: [{ text: systemPrompt }] },
+                    contents: messages,
+                    generationConfig: { temperature: 0.9, maxOutputTokens: 2048 }
+                };
 
                 const response = await fetch(
                     `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiKey}`,
                     {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            system_instruction: { parts: [{ text: systemPrompt }] },
-                            contents: messages,
-                            generationConfig: { temperature: 0.9, maxOutputTokens: 2048 }
-                        })
+                        body: JSON.stringify(requestBody)
                     }
                 );
                 const rawBody = await response.text();
@@ -160,6 +187,8 @@ router.post('/:storyId', auth, async (req, res) => {
                     statusText: response.statusText,
                     hasCandidates: Boolean(data?.candidates?.length),
                     hasError: Boolean(data?.error),
+                    requestBytes: Buffer.byteLength(JSON.stringify(requestBody), 'utf8'),
+                    finishReason: data?.candidates?.[0]?.finishReason || null,
                 });
 
                 if (!response.ok) {
@@ -188,6 +217,7 @@ router.post('/:storyId', auth, async (req, res) => {
                             storyId,
                             userId: req.user.id,
                             promptFeedback: data?.promptFeedback || null,
+                            finishReason: data?.candidates?.[0]?.finishReason || null,
                             candidates: data?.candidates || null,
                             body: data || rawBody,
                         };
@@ -206,9 +236,9 @@ router.post('/:storyId', auth, async (req, res) => {
                     }
                 }
             } catch (e) {
-                console.error("Gemini Error:", e);
+                console.error('Gemini Error:', e);
                 await writeGeminiErrorLog({
-                    model: 'gemini-2.5-flash',
+                    model: modelName,
                     storyId,
                     userId: req.user.id,
                     exception: e?.message || String(e),

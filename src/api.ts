@@ -53,9 +53,20 @@ export async function deleteStory(id: number) {
 }
 
 export async function updateStorySettings(id: number, viewer_settings: any) {
-    const res = await fetch(`${BASE}/stories/settings/${id}`, {
-        method: 'PUT', headers: authHeaders(), body: JSON.stringify({ viewer_settings })
+    const payload = JSON.stringify({ viewer_settings });
+    const headers = authHeaders();
+
+    let res = await fetch(`${BASE}/stories/settings/${id}`, {
+        method: 'PUT', headers, body: payload
     });
+
+    // 구버전 백엔드 경로 호환
+    if (res.status === 404) {
+        res = await fetch(`${BASE}/stories/${id}/settings`, {
+            method: 'PUT', headers, body: payload
+        });
+    }
+
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || `서버 오류 (${res.status})`);
