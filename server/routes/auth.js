@@ -6,6 +6,7 @@ import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import pkg from 'passport-naver-v2';
 const { Strategy: NaverStrategy } = pkg;
 import pool from '../db.js';
+import { resolveSessionUser } from '../session.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -113,39 +114,30 @@ router.get('/naver/callback',
     oauthCallback('naver'));
 
 // Token verify (프론트엔드가 토큰으로 본인 정보 확인)
-router.get('/me', (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token || token === 'null' || token === 'undefined') {
-        // Guest mode fallback
-        return res.json({ id: 1, role: 'admin', name: '손님' });
-    }
+router.get('/me', async (req, res) => {
     try {
-        const payload = jwt.verify(token, process.env.JWT_SECRET);
-        res.json(payload);
-    } catch {
-        res.status(401).json({ error: '토큰 만료 또는 유효하지 않음' });
+        const user = await resolveSessionUser(req, { allowGuestAdmin: true });
+        res.json(user);
+    } catch (err) {
+        res.status(err.status || 401).json({ error: err.message || '토큰 만료 또는 유효하지 않음' });
     }
 });
 
 // Admin: 전체 사용자 목록
 router.get('/users', async (req, res) => {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token || token === 'null' || token === 'undefined') {
-        return res.status(401).json({ error: '관리자 권한 필요 (로그인 안됨)' });
-    }
     try {
-        const me = jwt.verify(token, process.env.JWT_SECRET);
+        const me = await resolveSessionUser(req, { allowGuestAdmin: true });
         if (me.role !== 'admin') return res.status(403).json({ error: '관리자 권한 필요' });
 
         try {
-            const [rows] = await pool.query('SELECT id, name, email, role, provider, is_adult, is_premium, created_at FROM users ORDER BY id DESC');
+            const [rows] = await pool.query('SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, created_at AS createdAt FROM users ORDER BY id DESC');
             res.json(rows);
         } catch (dbErr) {
             console.error('Error fetching users:', dbErr);
             res.status(500).json({ error: '데이터베이스 조회 실패' });
         }
-    } catch {
-        res.status(401).json({ error: '인증 실패' });
+    } catch (err) {
+        res.status(err.status || 401).json({ error: err.message || '인증 실패' });
     }
 });
 

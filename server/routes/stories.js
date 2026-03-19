@@ -1,7 +1,7 @@
 import express from 'express';
-import jwt from 'jsonwebtoken';
 import pool from '../db.js';
 import { hydrateCharacterRow, serializeCharacterPayload } from '../persona.js';
+import { resolveSessionUser } from '../session.js';
 
 const router = express.Router();
 
@@ -15,19 +15,57 @@ function parseJsonField(value, fallback = null) {
     }
 }
 
+function normalizePublicStatus(value) {
+    return ['private', 'pending', 'approved', 'rejected'].includes(value) ? value : 'private';
+}
+
+function resolvePublicStoryState(currentStory, requestedPublic) {
+    const status = normalizePublicStatus(currentStory?.public_status);
+    if (!requestedPublic) {
+        return {
+            is_public: 0,
+            public_status: 'private',
+            public_requested_at: null,
+            public_reviewed_at: null,
+            public_reviewed_by: null,
+            public_review_message: null,
+        };
+    }
+
+    if (status === 'approved') {
+        return {
+            is_public: 1,
+            public_status: 'approved',
+            public_requested_at: currentStory?.public_requested_at || null,
+            public_reviewed_at: currentStory?.public_reviewed_at || null,
+            public_reviewed_by: currentStory?.public_reviewed_by || null,
+            public_review_message: currentStory?.public_review_message || null,
+        };
+    }
+
+    const requestedAt = status === 'pending'
+        ? (currentStory?.public_requested_at || new Date())
+        : new Date();
+
+    return {
+        is_public: 0,
+        public_status: 'pending',
+        public_requested_at: requestedAt,
+        public_reviewed_at: null,
+        public_reviewed_by: null,
+        public_review_message: null,
+    };
+}
+
 function auth(req, res, next) {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token || token === 'null' || token === 'undefined') {
-        // Guest mode fallback
-        req.user = { id: 1, role: 'admin', name: '손님' };
-        return next();
-    }
-    try {
-        req.user = jwt.verify(token, process.env.JWT_SECRET);
-        next();
-    } catch {
-        res.status(401).json({ error: '토큰 만료' });
-    }
+    resolveSessionUser(req, { allowGuestAdmin: true })
+        .then((user) => {
+            req.user = user;
+            next();
+        })
+        .catch((err) => {
+            res.status(err.status || 401).json({ error: err.message || '토큰 만료' });
+        });
 }
 
 async function updateStorySettingsHandler(req, res) {
@@ -101,12 +139,27 @@ router.post('/', auth, async (req, res) => {
 
         if (!title) throw new Error('이야기 제목은 필수입니다.');
         if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
+        const publicState = resolvePublicStoryState(null, Boolean(is_public));
 
         // 1. 이야기(방) 생성
         const [storyResult] = await conn.query(
-            `INSERT INTO stories (user_id, title, background, environment, is_public)
-             VALUES (?, ?, ?, ?, ?)`,
-            [req.user.id, title, background, environment, is_public ? 1 : 0]
+            `INSERT INTO stories (
+                user_id, title, background, environment, is_public, public_status,
+                public_requested_at, public_reviewed_at, public_reviewed_by, public_review_message, cover_image_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [
+                req.user.id,
+                title,
+                background,
+                environment,
+                publicState.is_public,
+                publicState.public_status,
+                publicState.public_requested_at,
+                publicState.public_reviewed_at,
+                publicState.public_reviewed_by,
+                publicState.public_review_message,
+                null,
+            ]
         );
         const storyId = storyResult.insertId;
 
@@ -152,18 +205,36 @@ router.put('/:id', auth, async (req, res) => {
     try {
         await conn.beginTransaction();
         const storyId = req.params.id;
-        const { title, background, environment, is_public, characters } = req.body;
+        const { title, background, environment, is_public, cover_image_url, characters } = req.body;
 
         // 본인 소유 확인
-        const [check] = await conn.query('SELECT id FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
+        const [check] = await conn.query('SELECT id, public_status, cover_image_url FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
         if (!check.length) throw new Error('권한이 없거나 이야기를 찾을 수 없습니다.');
         if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
+        const currentStory = check[0];
+        const publicState = resolvePublicStoryState(currentStory, Boolean(is_public));
+        const nextCoverImageUrl = normalizePublicStatus(currentStory.public_status) === 'approved' && typeof cover_image_url === 'string'
+            ? cover_image_url
+            : currentStory.cover_image_url || null;
 
         // 1. 이야기 메인 정보 업데이트
         await conn.query(
-            `UPDATE stories SET title=?, background=?, environment=?, is_public=?
+            `UPDATE stories SET title=?, background=?, environment=?, is_public=?, public_status=?, public_requested_at=?, public_reviewed_at=?, public_reviewed_by=?, public_review_message=?, cover_image_url=?
              WHERE id=? AND user_id=?`,
-            [title, background, environment, is_public ? 1 : 0, storyId, req.user.id]
+            [
+                title,
+                background,
+                environment,
+                publicState.is_public,
+                publicState.public_status,
+                publicState.public_requested_at,
+                publicState.public_reviewed_at,
+                publicState.public_reviewed_by,
+                publicState.public_review_message,
+                nextCoverImageUrl,
+                storyId,
+                req.user.id,
+            ]
         );
 
         // 2. 등장인물 업데이트 (단순화를 위해 기존 인물 삭제 후 재생성)
@@ -200,6 +271,37 @@ router.put('/:id', auth, async (req, res) => {
     }
 });
 
+router.get('/community', auth, async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT
+                s.id,
+                s.title,
+                s.background,
+                s.environment,
+                s.cover_image_url AS coverImageUrl,
+                s.public_status AS publicStatus,
+                s.is_public AS isPublic,
+                s.updated_at AS updatedAt,
+                s.created_at AS createdAt,
+                u.name AS authorName,
+                u.role AS authorRole
+            FROM stories s
+            LEFT JOIN users u ON u.id = s.user_id
+            WHERE s.is_public = 1
+              AND s.public_status = 'approved'
+              AND s.user_id <> ?
+            ORDER BY s.updated_at DESC, s.id DESC
+            LIMIT 100
+        `, [req.user.id]);
+
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching community stories:', err);
+        res.status(500).json({ error: '커뮤니티 목록을 불러올 수 없습니다.' });
+    }
+});
+
 // ── 이야기 삭제 ─────────────────────────────────────────────
 router.delete('/:id', auth, async (req, res) => {
     try {
@@ -215,9 +317,22 @@ router.delete('/:id', auth, async (req, res) => {
 // ── 공개 이야기 목록 조회 ───────────────────────────────────
 router.get('/public/feed', async (_req, res) => {
     try {
-        const [rows] = await pool.query(
-            'SELECT id, title, background FROM stories WHERE is_public=1 ORDER BY updated_at DESC LIMIT 50'
-        );
+        const [rows] = await pool.query(`
+            SELECT
+                s.id,
+                s.title,
+                s.background,
+                s.environment,
+                s.cover_image_url AS coverImageUrl,
+                s.updated_at AS updatedAt,
+                u.name AS authorName
+            FROM stories s
+            LEFT JOIN users u ON u.id = s.user_id
+            WHERE s.is_public=1
+              AND s.public_status='approved'
+            ORDER BY s.updated_at DESC, s.id DESC
+            LIMIT 50
+        `);
         res.json(rows);
     } catch (err) {
         console.error('Error fetching public stories:', err);

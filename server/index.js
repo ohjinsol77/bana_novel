@@ -14,6 +14,7 @@ import { initDB } from './db.js';
 import authRouter, { passport } from './routes/auth.js';
 import storiesRouter from './routes/stories.js';
 import chatRouter from './routes/chat.js';
+import adminRouter from './routes/admin.js';
 
 const app = express();
 const PORT = process.env.PORT || 4000;
@@ -69,6 +70,7 @@ passport.deserializeUser((user, done) => done(null, user));
 app.use('/api/auth', authRouter);
 app.use('/api/stories', storiesRouter);
 app.use('/api/chat', chatRouter);
+app.use('/api/admin', adminRouter);
 
 app.get('/health', (_req, res) => {
     res.json({

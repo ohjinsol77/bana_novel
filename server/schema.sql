@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     role        ENUM('user','admin') DEFAULT 'user',
     is_adult    TINYINT(1) DEFAULT 0,
     is_premium  TINYINT(1) DEFAULT 0,
+    is_suspended TINYINT(1) DEFAULT 0,
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_oauth (oauth_id, provider)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -26,7 +27,13 @@ CREATE TABLE IF NOT EXISTS stories (
     background      TEXT,
     environment     TEXT,
     viewer_settings LONGTEXT,
+    cover_image_url LONGTEXT,
     is_public       TINYINT(1) DEFAULT 0,
+    public_status   ENUM('private','pending','approved','rejected') DEFAULT 'private',
+    public_requested_at DATETIME NULL,
+    public_reviewed_at DATETIME NULL,
+    public_reviewed_by INT NULL,
+    public_review_message TEXT NULL,
     created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE

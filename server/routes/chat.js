@@ -1,11 +1,11 @@
 import express from 'express';
-import jwt from 'jsonwebtoken';
 import pool from '../db.js';
 import { appendFile, mkdir } from 'fs/promises';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { formatCharacterPersona, hydrateCharacterRow } from '../persona.js';
+import { resolveSessionUser } from '../session.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -45,18 +45,14 @@ async function writeChatDebugLog(details) {
 }
 
 function auth(req, res, next) {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (!token || token === 'null' || token === 'undefined') {
-        // Guest mode fallback: use ID 1 (Admin/Seed user)
-        req.user = { id: 1, role: 'admin', name: '손님' };
-        return next();
-    }
-    try {
-        req.user = jwt.verify(token, process.env.JWT_SECRET);
-        next();
-    } catch {
-        res.status(401).json({ error: '토큰 만료' });
-    }
+    resolveSessionUser(req, { allowGuestAdmin: true })
+        .then((user) => {
+            req.user = user;
+            next();
+        })
+        .catch((err) => {
+            res.status(err.status || 401).json({ error: err.message || '토큰 만료' });
+        });
 }
 
 // 대화 이력 조회 (이제 스토리 단위)
@@ -206,10 +202,24 @@ router.post('/:storyId', auth, async (req, res) => {
                     await writeGeminiErrorLog(errorDetails);
                     aiReply = GEMINI_FAILURE_MESSAGE;
                 } else {
-                    const generatedText = data?.candidates?.[0]?.content?.parts
+                    let generatedText = data?.candidates?.[0]?.content?.parts
                         ?.map((part) => part?.text || '')
                         .join('')
                         .trim();
+
+                    // 토큰 제한(MAX_TOKENS) 등으로 인해 응답이 중간에 끊긴 경우, 마지막 완성된 형식의 문장까지만 유지합니다.
+                    if (generatedText) {
+                        const finishReason = data?.candidates?.[0]?.finishReason;
+                        const isCutOff = finishReason === 'MAX_TOKENS' || !/[.!?”\'\"]$/.test(generatedText);
+                        if (isCutOff && generatedText.length > 100) {
+                            // 문장의 끝을 나타내는 구두점(., !, ?, 따옴표 등)으로 끝나는 덩어리들만 모두 모아 합침으로써 
+                            // 뒤에 덜 작성된 미완성 문자열 찌꺼기를 깔끔하게 제거합니다.
+                            const sentences = generatedText.match(/[^.!?”\'\"]+[.!?”\'\"]+/g);
+                            if (sentences && sentences.length > 0) {
+                                generatedText = sentences.join('').trim();
+                            }
+                        }
+                    }
 
                     if (!generatedText) {
                         const errorDetails = {
@@ -298,8 +308,8 @@ router.delete('/:storyId/clear', auth, async (req, res) => {
 });
 
 function buildWriterPrompt(story, characters) {
-    let prompt = `당신은 뛰어난 웹소설의 공동 작가입니다. 사용자와 함께 번갈아가며 훌륭한 소설 한 편을 만들어가야 합니다.
-사용자의 지시나 대사가 입력되면, 아래에 주어진 <배경 세계관>과 <등장인물 설정>을 완벽하게 반영하여 이야기의 **다음 단락(상황 묘사, 대화 등)**을 소설체로 길고 생생하게 집필하세요. 사용자가 등장인물 중 한 명의 시점이 될 수도, 전지적 작가 시점이 될 수도 있습니다.
+    let prompt = `당신은 뛰어난 웹소설의 공동 작가입니다. 직전 입력을 바탕으로, 아래에 주어진 <배경 세계관>과 <등장인물 설정>을 완벽하게 반영해 이야기의 **다음 장면(상황 묘사, 대화 등)**을 소설체로 길고 생생하게 작성하세요.
+등장인물 설정은 모두 이야기 속 인물들의 성격, 관계, 역할을 뜻합니다. 이 정보는 소설 속 장면을 자연스럽게 이어 쓰는 데만 사용하세요.
 
 <소설 배경 및 세계관>
 제목: ${story.title}
@@ -315,10 +325,11 @@ function buildWriterPrompt(story, characters) {
 
     prompt += `
 <집필 규칙>
-1. 사용자의 직전 입력을 부드럽게 이어받아 흥미진진하게 내용을 전개하세요.
-2. 각 캐릭터의 성격과 말투를 일관성 있게 묘사하세요. 여러 캐릭터가 동시에 대화하거나 얽히는 장면을 적극적으로 묘사하세요.
+1. 직전 입력은 장면 지시로 받아들이고, 그 흐름을 자연스럽게 이어서 흥미진진하게 전개하세요.
+2. 각 캐릭터의 성격, 이야기 속 관계, 말투를 일관성 있게 묘사하세요. 독자나 작가와의 관계는 절대 언급하지 마세요. 여러 캐릭터가 동시에 대화하거나 얽히는 장면을 적극적으로 묘사하세요.
 3. 한국어 웹소설 문체를 사용하세요. 지문과 대화를 적절히 분배하세요.
-4. AI임을 암시하는 말("네, 이어서 작성하겠습니다" 등)은 절대 출력하지 말고 바로 소설 본문만 작성하세요.`;
+4. AI임을 암시하는 말("네, 이어서 작성하겠습니다" 등)은 절대 출력하지 말고 바로 소설 본문만 작성하세요.
+5. 분량은 적절히(한국어 약 1000자~1500자 내외) 조절하여, 글이 도중에 잘리지 않도록 반드시 완전한 문장(마침표, 따옴표 등)으로 끝맺으세요.`;
 
     return prompt;
 }

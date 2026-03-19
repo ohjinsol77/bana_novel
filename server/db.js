@@ -33,6 +33,7 @@ export async function initDB() {
                 role        ENUM('user','admin') DEFAULT 'user',
                 is_adult    TINYINT(1) DEFAULT 0,
                 is_premium  TINYINT(1) DEFAULT 0,
+                is_suspended TINYINT(1) DEFAULT 0,
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY uniq_oauth (oauth_id, provider)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -51,7 +52,13 @@ export async function initDB() {
                 background      TEXT,
                 environment     TEXT,
                 viewer_settings LONGTEXT,
+                cover_image_url LONGTEXT,
                 is_public       TINYINT(1) DEFAULT 0,
+                public_status   ENUM('private','pending','approved','rejected') DEFAULT 'private',
+                public_requested_at DATETIME NULL,
+                public_reviewed_at DATETIME NULL,
+                public_reviewed_by INT NULL,
+                public_review_message TEXT NULL,
                 created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -86,6 +93,78 @@ export async function initDB() {
             await conn.query('ALTER TABLE stories ADD COLUMN viewer_settings LONGTEXT NULL AFTER environment;');
         }
 
+        const [coverColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'cover_image_url'
+            LIMIT 1
+        `);
+        if (!coverColumns.length) {
+            await conn.query('ALTER TABLE stories ADD COLUMN cover_image_url LONGTEXT NULL AFTER viewer_settings;');
+        }
+
+        const [publicStatusColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'public_status'
+            LIMIT 1
+        `);
+        if (!publicStatusColumns.length) {
+            await conn.query("ALTER TABLE stories ADD COLUMN public_status ENUM('private','pending','approved','rejected') DEFAULT 'private' AFTER is_public;");
+        }
+
+        const [publicRequestedColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'public_requested_at'
+            LIMIT 1
+        `);
+        if (!publicRequestedColumns.length) {
+            await conn.query('ALTER TABLE stories ADD COLUMN public_requested_at DATETIME NULL AFTER public_status;');
+        }
+
+        const [publicReviewedAtColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'public_reviewed_at'
+            LIMIT 1
+        `);
+        if (!publicReviewedAtColumns.length) {
+            await conn.query('ALTER TABLE stories ADD COLUMN public_reviewed_at DATETIME NULL AFTER public_requested_at;');
+        }
+
+        const [publicReviewedByColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'public_reviewed_by'
+            LIMIT 1
+        `);
+        if (!publicReviewedByColumns.length) {
+            await conn.query('ALTER TABLE stories ADD COLUMN public_reviewed_by INT NULL AFTER public_reviewed_at;');
+        }
+
+        const [publicReviewMessageColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'public_review_message'
+            LIMIT 1
+        `);
+        if (!publicReviewMessageColumns.length) {
+            await conn.query('ALTER TABLE stories ADD COLUMN public_review_message TEXT NULL AFTER public_reviewed_by;');
+        }
+
         const [personaJsonColumns] = await conn.query(`
             SELECT column_name
             FROM information_schema.columns
@@ -96,6 +175,18 @@ export async function initDB() {
         `);
         if (!personaJsonColumns.length) {
             await conn.query('ALTER TABLE story_characters ADD COLUMN persona_json LONGTEXT NULL AFTER name;');
+        }
+
+        const [suspendedColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'is_suspended'
+            LIMIT 1
+        `);
+        if (!suspendedColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN is_suspended TINYINT(1) DEFAULT 0 AFTER is_premium;');
         }
 
         const [legacyCharacters] = await conn.query(`
