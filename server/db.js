@@ -18,6 +18,95 @@ const pool = mysql.createPool({
     charset: 'utf8mb4',
 });
 
+export const WELCOME_POINT_BONUS = 50;
+export const NORMAL_STORY_LIMIT = 3;
+export const PREMIUM_STORY_LIMIT = 30;
+export const NORMAL_CHAT_POINT_COST = 15;
+export const PREMIUM_CHAT_POINT_COST = 10;
+export const POINT_TOP_UP_OPTIONS = [50, 100, 300, 500, 1000];
+
+function createAppError(message, status = 400, code = 'APP_ERROR', extra = {}) {
+    const error = new Error(message);
+    error.status = status;
+    error.code = code;
+    Object.assign(error, extra);
+    return error;
+}
+
+export function getStoryLimitForUser(user) {
+    if (user?.role === 'admin') return PREMIUM_STORY_LIMIT;
+    return user?.is_premium ? PREMIUM_STORY_LIMIT : NORMAL_STORY_LIMIT;
+}
+
+export function getChatPointCostForUser(user) {
+    if (user?.role === 'admin') return 0;
+    return user?.is_premium ? PREMIUM_CHAT_POINT_COST : NORMAL_CHAT_POINT_COST;
+}
+
+export async function adjustUserPointBalance(conn, {
+    userId,
+    amount,
+    transactionType,
+    note = null,
+    referenceType = null,
+    referenceId = null,
+    createdBy = null,
+    allowNegative = false,
+}) {
+    if (!Number.isInteger(amount) || amount === 0) {
+        throw createAppError('포인트 조정 금액이 올바르지 않습니다.', 400, 'INVALID_POINT_AMOUNT');
+    }
+
+    const [rows] = await conn.query(
+        'SELECT id, point_balance AS pointBalance FROM users WHERE id=? LIMIT 1 FOR UPDATE',
+        [userId]
+    );
+
+    if (!rows.length) {
+        throw createAppError('회원을 찾을 수 없습니다.', 404, 'USER_NOT_FOUND');
+    }
+
+    const currentBalance = Number(rows[0].pointBalance || 0);
+    const nextBalance = currentBalance + amount;
+
+    if (!allowNegative && nextBalance < 0) {
+        throw createAppError('포인트가 부족합니다.', 402, 'INSUFFICIENT_POINTS', {
+            pointBalance: currentBalance,
+            requiredPoints: Math.abs(amount),
+            shortage: Math.abs(nextBalance),
+            topUpOptions: POINT_TOP_UP_OPTIONS,
+        });
+    }
+
+    await conn.query(
+        'UPDATE users SET point_balance=? WHERE id=?',
+        [nextBalance, userId]
+    );
+
+    const [result] = await conn.query(
+        `INSERT INTO point_transactions (
+            user_id, amount, balance_after, transaction_type,
+            note, reference_type, reference_id, created_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+            userId,
+            amount,
+            nextBalance,
+            transactionType,
+            note,
+            referenceType,
+            referenceId,
+            createdBy,
+        ]
+    );
+
+    return {
+        transactionId: result.insertId,
+        beforeBalance: currentBalance,
+        afterBalance: nextBalance,
+    };
+}
+
 export async function initDB() {
     const conn = await pool.getConnection();
     try {
@@ -34,6 +123,8 @@ export async function initDB() {
                 is_adult    TINYINT(1) DEFAULT 0,
                 is_premium  TINYINT(1) DEFAULT 0,
                 is_suspended TINYINT(1) DEFAULT 0,
+                can_publish_community TINYINT(1) DEFAULT 0,
+                point_balance INT NOT NULL DEFAULT 0,
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY uniq_oauth (oauth_id, provider)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
@@ -55,6 +146,7 @@ export async function initDB() {
                 cover_image_url LONGTEXT,
                 is_public       TINYINT(1) DEFAULT 0,
                 public_status   ENUM('private','pending','approved','rejected') DEFAULT 'private',
+                public_method   ENUM('private','request','approved','direct') DEFAULT 'private',
                 public_requested_at DATETIME NULL,
                 public_reviewed_at DATETIME NULL,
                 public_reviewed_by INT NULL,
@@ -115,6 +207,27 @@ export async function initDB() {
         `);
         if (!publicStatusColumns.length) {
             await conn.query("ALTER TABLE stories ADD COLUMN public_status ENUM('private','pending','approved','rejected') DEFAULT 'private' AFTER is_public;");
+        }
+
+        const [publicMethodColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'stories'
+              AND column_name = 'public_method'
+            LIMIT 1
+        `);
+        if (!publicMethodColumns.length) {
+            await conn.query("ALTER TABLE stories ADD COLUMN public_method ENUM('private','request','approved','direct') DEFAULT 'private' AFTER public_status;");
+            await conn.query(`
+                UPDATE stories
+                SET public_method = CASE
+                    WHEN is_public = 1 AND public_status = 'approved' THEN 'approved'
+                    WHEN public_status = 'pending' THEN 'request'
+                    ELSE 'private'
+                END
+                WHERE public_method IS NULL OR public_method = ''
+            `);
         }
 
         const [publicRequestedColumns] = await conn.query(`
@@ -187,6 +300,73 @@ export async function initDB() {
         `);
         if (!suspendedColumns.length) {
             await conn.query('ALTER TABLE users ADD COLUMN is_suspended TINYINT(1) DEFAULT 0 AFTER is_premium;');
+        }
+
+        const [communityPublishColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'can_publish_community'
+            LIMIT 1
+        `);
+        if (!communityPublishColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN can_publish_community TINYINT(1) DEFAULT 0 AFTER is_suspended;');
+        }
+
+        const [pointBalanceColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'point_balance'
+            LIMIT 1
+        `);
+        if (!pointBalanceColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN point_balance INT NOT NULL DEFAULT 0 AFTER can_publish_community;');
+        } else {
+            await conn.query('ALTER TABLE users MODIFY COLUMN point_balance INT NOT NULL DEFAULT 0;');
+        }
+
+        await conn.query(`
+            UPDATE users
+            SET point_balance = COALESCE(point_balance, 0)
+            WHERE point_balance IS NULL
+        `);
+
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS point_transactions (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                user_id         INT NOT NULL,
+                amount          INT NOT NULL,
+                balance_after   INT NOT NULL,
+                transaction_type ENUM('welcome','topup','chat','admin_grant','admin_deduct','refund','adjustment') NOT NULL,
+                note            VARCHAR(255) NULL,
+                reference_type  VARCHAR(50) NULL,
+                reference_id    INT NULL,
+                created_by      INT NULL,
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_point_transactions_user_created (user_id, created_at),
+                INDEX idx_point_transactions_type_created (transaction_type, created_at),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+
+        const [pointUserCreatedIndex] = await conn.query(`
+            SHOW INDEX FROM point_transactions
+            WHERE Key_name = 'idx_point_transactions_user_created'
+        `);
+        if (!pointUserCreatedIndex.length) {
+            await conn.query('CREATE INDEX idx_point_transactions_user_created ON point_transactions (user_id, created_at);');
+        }
+
+        const [pointTypeCreatedIndex] = await conn.query(`
+            SHOW INDEX FROM point_transactions
+            WHERE Key_name = 'idx_point_transactions_type_created'
+        `);
+        if (!pointTypeCreatedIndex.length) {
+            await conn.query('CREATE INDEX idx_point_transactions_type_created ON point_transactions (transaction_type, created_at);');
         }
 
         const [legacyCharacters] = await conn.query(`

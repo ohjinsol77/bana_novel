@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../db.js';
+import { adjustUserPointBalance, getChatPointCostForUser, getStoryLimitForUser } from '../db.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -175,7 +176,7 @@ async function fetchCountRows(tableName, start, end, granularity) {
     return rows;
 }
 
-async function fetchRangeStats(start, end, granularity) {
+async function fetchRangeStats({ preset, start, end, granularity }) {
     const [userRows, storyRows, messageRows, summaryRows] = await Promise.all([
         fetchCountRows('users', start, end, granularity),
         fetchCountRows('stories', start, end, granularity),
@@ -232,6 +233,192 @@ async function fetchRangeStats(start, end, granularity) {
     };
 }
 
+async function loadPointTransactions(limit = 150) {
+    const [rows] = await pool.query(
+        `
+        SELECT
+            p.id,
+            p.user_id AS userId,
+            u.name AS userName,
+            u.email AS userEmail,
+            u.role AS userRole,
+            u.is_premium AS isPremium,
+            p.amount,
+            p.balance_after AS balanceAfter,
+            p.transaction_type AS transactionType,
+            p.note,
+            p.reference_type AS referenceType,
+            p.reference_id AS referenceId,
+            p.created_by AS createdBy,
+            p.created_at AS createdAt
+        FROM point_transactions p
+        LEFT JOIN users u ON u.id = p.user_id
+        ORDER BY p.created_at DESC, p.id DESC
+        LIMIT ?
+        `,
+        [limit]
+    );
+    return rows.map((row) => ({
+        ...row,
+        amount: toNumber(row.amount),
+        balanceAfter: toNumber(row.balanceAfter),
+        userId: toNumber(row.userId),
+        referenceId: row.referenceId === null || row.referenceId === undefined ? null : toNumber(row.referenceId, null),
+        createdBy: row.createdBy === null || row.createdBy === undefined ? null : toNumber(row.createdBy, null),
+    }));
+}
+
+async function loadPointUserDetail(userId) {
+    const [userRows, storyRows, recentTransactions] = await Promise.all([
+        pool.query(
+            `
+            SELECT
+                id, name, email, role, provider,
+                is_adult AS isAdult,
+                is_premium AS isPremium,
+                is_suspended AS isSuspended,
+                can_publish_community AS canPublishCommunity,
+                point_balance AS pointBalance,
+                created_at AS createdAt
+            FROM users
+            WHERE id=?
+            LIMIT 1
+            `,
+            [userId]
+        ),
+        pool.query('SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?', [userId]),
+        pool.query(
+            `
+            SELECT
+                id,
+                user_id AS userId,
+                amount,
+                balance_after AS balanceAfter,
+                transaction_type AS transactionType,
+                note,
+                reference_type AS referenceType,
+                reference_id AS referenceId,
+                created_by AS createdBy,
+                created_at AS createdAt
+            FROM point_transactions
+            WHERE user_id=?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 30
+            `,
+            [userId]
+        ),
+    ]);
+
+    const user = userRows[0][0];
+    if (!user) return null;
+
+    const sessionLikeUser = {
+        role: user.role,
+        is_premium: Boolean(user.isPremium),
+    };
+
+    return {
+        user: {
+            ...user,
+            pointBalance: toNumber(user.pointBalance),
+        },
+        storyCount: toNumber(storyRows[0][0]?.storyCount),
+        storyLimit: getStoryLimitForUser(sessionLikeUser),
+        chatCost: getChatPointCostForUser(sessionLikeUser),
+        recentTransactions: recentTransactions[0].map((row) => ({
+            ...row,
+            userId: toNumber(row.userId),
+            amount: toNumber(row.amount),
+            balanceAfter: toNumber(row.balanceAfter),
+            referenceId: row.referenceId === null || row.referenceId === undefined ? null : toNumber(row.referenceId, null),
+            createdBy: row.createdBy === null || row.createdBy === undefined ? null : toNumber(row.createdBy, null),
+        })),
+    };
+}
+
+async function buildPointDashboard() {
+    const [summaryRows, ledgerRows, topUsers, transactionTypeRows, dailyFlowRows] = await Promise.all([
+        pool.query(`
+            SELECT
+                (SELECT COUNT(*) FROM users) AS userCount,
+                (SELECT COUNT(*) FROM users WHERE is_premium=1) AS premiumUserCount,
+                (SELECT COUNT(*) FROM users WHERE point_balance > 0) AS activePointUserCount,
+                (SELECT COALESCE(SUM(point_balance), 0) FROM users) AS totalBalance,
+                (SELECT COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) FROM point_transactions) AS totalInflow,
+                (SELECT COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) FROM point_transactions) AS totalOutflow,
+                (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'welcome' THEN amount ELSE 0 END), 0) FROM point_transactions) AS welcomeGranted,
+                (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'topup' THEN amount ELSE 0 END), 0) FROM point_transactions) AS totalTopup,
+                (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'chat' AND amount < 0 THEN ABS(amount) ELSE 0 END), 0) FROM point_transactions) AS chatSpent,
+                (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'admin_grant' THEN amount ELSE 0 END), 0) FROM point_transactions) AS adminGranted,
+                (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'admin_deduct' AND amount < 0 THEN ABS(amount) ELSE 0 END), 0) FROM point_transactions) AS adminDeducted,
+                (SELECT COUNT(*) FROM point_transactions) AS transactionCount,
+                (SELECT COUNT(*) FROM point_transactions WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS transactions24h,
+                (SELECT COALESCE(SUM(amount), 0) FROM point_transactions WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS net24h
+        `),
+        loadPointTransactions(150),
+        pool.query(`
+            SELECT id, name, email, role, is_premium AS isPremium, point_balance AS pointBalance, created_at AS createdAt
+            FROM users
+            ORDER BY point_balance DESC, id DESC
+            LIMIT 50
+        `),
+        pool.query(`
+            SELECT transaction_type AS label, COUNT(*) AS value
+            FROM point_transactions
+            GROUP BY transaction_type
+            ORDER BY value DESC, label ASC
+        `),
+        pool.query(`
+            SELECT
+                DATE_FORMAT(created_at, '%Y-%m-%d') AS bucket,
+                COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS inflow,
+                COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) AS outflow,
+                COALESCE(SUM(amount), 0) AS net
+            FROM point_transactions
+            WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 13 DAY)
+            GROUP BY bucket
+            ORDER BY bucket ASC
+        `),
+    ]);
+
+    const summaryRow = summaryRows[0][0] || {};
+    return {
+        summary: {
+            userCount: toNumber(summaryRow.userCount),
+            premiumUserCount: toNumber(summaryRow.premiumUserCount),
+            activePointUserCount: toNumber(summaryRow.activePointUserCount),
+            totalBalance: toNumber(summaryRow.totalBalance),
+            totalInflow: toNumber(summaryRow.totalInflow),
+            totalOutflow: toNumber(summaryRow.totalOutflow),
+            welcomeGranted: toNumber(summaryRow.welcomeGranted),
+            totalTopup: toNumber(summaryRow.totalTopup),
+            chatSpent: toNumber(summaryRow.chatSpent),
+            adminGranted: toNumber(summaryRow.adminGranted),
+            adminDeducted: toNumber(summaryRow.adminDeducted),
+            transactionCount: toNumber(summaryRow.transactionCount),
+            transactions24h: toNumber(summaryRow.transactions24h),
+            net24h: toNumber(summaryRow.net24h),
+        },
+        ledger: ledgerRows,
+        topUsers: topUsers[0].map((row) => ({
+            ...row,
+            id: toNumber(row.id),
+            isPremium: toNumber(row.isPremium),
+            pointBalance: toNumber(row.pointBalance),
+        })),
+        transactionTypes: transactionTypeRows[0].map((row) => ({
+            label: row.label,
+            value: toNumber(row.value),
+        })),
+        dailyFlow: dailyFlowRows[0].map((row) => ({
+            bucket: row.bucket,
+            inflow: toNumber(row.inflow),
+            outflow: toNumber(row.outflow),
+            net: toNumber(row.net),
+        })),
+    };
+}
+
 async function refreshDashboard(res, query = {}) {
     const period = parseStatsRange(query);
     const [summaryRows] = await pool.query(`
@@ -248,6 +435,10 @@ async function refreshDashboard(res, query = {}) {
             (SELECT COUNT(*) FROM story_messages) AS messageCount,
             (SELECT COUNT(DISTINCT user_id) FROM stories) AS storyOwnerCount,
             (SELECT COUNT(DISTINCT user_id) FROM story_messages) AS activeWriterCount,
+            (SELECT COALESCE(SUM(point_balance), 0) FROM users) AS totalPointBalance,
+            (SELECT COUNT(*) FROM point_transactions) AS pointTransactionCount,
+            (SELECT COALESCE(SUM(CASE WHEN transaction_type='topup' THEN amount ELSE 0 END), 0) FROM point_transactions) AS pointTopupTotal,
+            (SELECT COALESCE(SUM(CASE WHEN transaction_type='chat' AND amount < 0 THEN ABS(amount) ELSE 0 END), 0) FROM point_transactions) AS pointChatSpent,
             (SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS users24h,
             (SELECT COUNT(*) FROM stories WHERE updated_at >= NOW() - INTERVAL 24 HOUR) AS stories24h,
             (SELECT COUNT(*) FROM story_messages WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS messages24h,
@@ -270,6 +461,10 @@ async function refreshDashboard(res, query = {}) {
         messageCount: toNumber(rawSummary.messageCount),
         storyOwnerCount: toNumber(rawSummary.storyOwnerCount),
         activeWriterCount: toNumber(rawSummary.activeWriterCount),
+        totalPointBalance: toNumber(rawSummary.totalPointBalance),
+        pointTransactionCount: toNumber(rawSummary.pointTransactionCount),
+        pointTopupTotal: toNumber(rawSummary.pointTopupTotal),
+        pointChatSpent: toNumber(rawSummary.pointChatSpent),
         users24h: toNumber(rawSummary.users24h),
         stories24h: toNumber(rawSummary.stories24h),
         messages24h: toNumber(rawSummary.messages24h),
@@ -279,7 +474,7 @@ async function refreshDashboard(res, query = {}) {
     };
 
     const [users] = await pool.query(`
-        SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, created_at AS createdAt
+        SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, point_balance AS pointBalance, created_at AS createdAt
         FROM users
         ORDER BY created_at DESC, id DESC
     `);
@@ -292,6 +487,7 @@ async function refreshDashboard(res, query = {}) {
             s.environment,
             s.is_public AS isPublic,
             s.public_status AS publicStatus,
+            s.public_method AS publicMethod,
             s.cover_image_url AS coverImageUrl,
             s.public_requested_at AS publicRequestedAt,
             s.public_reviewed_at AS publicReviewedAt,
@@ -326,6 +522,7 @@ async function refreshDashboard(res, query = {}) {
             s.environment,
             s.is_public AS isPublic,
             s.public_status AS publicStatus,
+            s.public_method AS publicMethod,
             s.cover_image_url AS coverImageUrl,
             s.created_at AS createdAt,
             s.updated_at AS updatedAt,
@@ -357,6 +554,7 @@ async function refreshDashboard(res, query = {}) {
             s.environment,
             s.is_public AS isPublic,
             s.public_status AS publicStatus,
+            s.public_method AS publicMethod,
             s.cover_image_url AS coverImageUrl,
             s.public_requested_at AS publicRequestedAt,
             s.public_review_message AS publicReviewMessage,
@@ -413,7 +611,8 @@ async function refreshDashboard(res, query = {}) {
             FROM story_messages
             GROUP BY story_id
         ) msg_counts ON msg_counts.story_id = s.id
-        WHERE s.public_status IN ('approved', 'rejected')
+        WHERE (s.public_status = 'approved' AND s.public_method = 'approved')
+           OR s.public_status = 'rejected'
         ORDER BY COALESCE(s.public_reviewed_at, s.updated_at) DESC, s.id DESC
         LIMIT 20
     `);
@@ -442,8 +641,8 @@ async function refreshDashboard(res, query = {}) {
             ROUND((data_length + index_length) / 1024 / 1024, 2) AS sizeMb
         FROM information_schema.tables
         WHERE table_schema = DATABASE()
-          AND table_name IN ('users', 'stories', 'story_characters', 'story_messages')
-        ORDER BY FIELD(table_name, 'users', 'stories', 'story_characters', 'story_messages')
+          AND table_name IN ('users', 'stories', 'story_characters', 'story_messages', 'point_transactions')
+        ORDER BY FIELD(table_name, 'users', 'stories', 'story_characters', 'story_messages', 'point_transactions')
     `);
 
     const [hourlyUsage] = await pool.query(`
@@ -565,7 +764,7 @@ async function refreshDashboard(res, query = {}) {
     `);
 
     const averageRow = averageRows[0] || {};
-    const periodStats = await fetchRangeStats(period.start, period.end, period.granularity);
+    const periodStats = await fetchRangeStats(period);
 
     const payload = {
         summary,
@@ -644,7 +843,22 @@ router.get('/stories/:id', auth, requireAdmin, async (req, res) => {
         const storyId = req.params.id;
         const [storyRows] = await pool.query(`
             SELECT
-                s.*,
+                s.id,
+                s.user_id AS userId,
+                s.title,
+                s.background,
+                s.environment,
+                s.viewer_settings AS viewerSettings,
+                s.cover_image_url AS coverImageUrl,
+                s.is_public AS isPublic,
+                s.public_status AS publicStatus,
+                s.public_method AS publicMethod,
+                s.public_requested_at AS publicRequestedAt,
+                s.public_reviewed_at AS publicReviewedAt,
+                s.public_reviewed_by AS publicReviewedBy,
+                s.public_review_message AS publicReviewMessage,
+                s.created_at AS createdAt,
+                s.updated_at AS updatedAt,
                 u.name AS authorName,
                 u.email AS authorEmail,
                 u.role AS authorRole
@@ -672,11 +886,7 @@ router.get('/stories/:id', auth, requireAdmin, async (req, res) => {
         res.json({
             story: {
                 ...story,
-                viewer_settings: parseJsonField(story.viewer_settings, null),
-                isPublic: Boolean(story.is_public),
-                authorName: story.authorName,
-                authorEmail: story.authorEmail,
-                authorRole: story.authorRole,
+                viewerSettings: parseJsonField(story.viewerSettings, null),
             },
             characters: characterRows.map(hydrateCharacterRow),
             messages: messageRows,
@@ -696,6 +906,7 @@ router.patch('/stories/:id/visibility', auth, requireAdmin, async (req, res) => 
             SET
                 is_public=?,
                 public_status=?,
+                public_method=?,
                 public_requested_at=?,
                 public_reviewed_at=NOW(),
                 public_reviewed_by=?,
@@ -703,6 +914,7 @@ router.patch('/stories/:id/visibility', auth, requireAdmin, async (req, res) => 
             WHERE id=?
         `, [
             isPublic,
+            isPublic ? 'approved' : 'private',
             isPublic ? 'approved' : 'private',
             isPublic ? null : null,
             req.user.id,
@@ -739,6 +951,7 @@ router.patch('/stories/:id/review', auth, requireAdmin, async (req, res) => {
                     SET
                         is_public=1,
                         public_status='approved',
+                        public_method='approved',
                         public_requested_at=COALESCE(public_requested_at, NOW()),
                         public_reviewed_at=NOW(),
                         public_reviewed_by=?,
@@ -750,6 +963,7 @@ router.patch('/stories/:id/review', auth, requireAdmin, async (req, res) => {
                     SET
                         is_public=0,
                         public_status='rejected',
+                        public_method='request',
                         public_reviewed_at=NOW(),
                         public_reviewed_by=?,
                         public_review_message=?
@@ -785,10 +999,95 @@ router.delete('/stories/:id', auth, requireAdmin, async (req, res) => {
     }
 });
 
+router.get('/points/dashboard', auth, requireAdmin, async (_req, res) => {
+    try {
+        const payload = await buildPointDashboard();
+        res.json(payload);
+    } catch (err) {
+        console.error('Error loading admin point dashboard:', err);
+        res.status(500).json({ error: '포인트 대시보드를 불러올 수 없습니다.' });
+    }
+});
+
+router.get('/users/:id/detail', auth, requireAdmin, async (req, res) => {
+    try {
+        const detail = await loadPointUserDetail(req.params.id);
+        if (!detail) {
+            return res.status(404).json({ error: '회원을 찾을 수 없습니다.' });
+        }
+        return res.json(detail);
+    } catch (err) {
+        console.error('Error loading admin user detail:', err);
+        res.status(500).json({ error: '회원 정보를 불러올 수 없습니다.' });
+    }
+});
+
+router.post('/users/:id/points', auth, requireAdmin, async (req, res) => {
+    const amount = Math.trunc(Number(req.body?.amount));
+    const note = String(req.body?.note || '').trim();
+
+    if (!Number.isInteger(amount) || amount === 0) {
+        return res.status(400).json({ error: '변경할 포인트를 정확히 입력해주세요.' });
+    }
+    if (!note) {
+        return res.status(400).json({ error: '포인트 변경 사유를 입력해주세요.' });
+    }
+
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        const [targetRows] = await conn.query(
+            'SELECT id, role FROM users WHERE id=? LIMIT 1 FOR UPDATE',
+            [req.params.id]
+        );
+
+        if (!targetRows.length) {
+            const error = new Error('회원을 찾을 수 없습니다.');
+            error.status = 404;
+            throw error;
+        }
+        if (targetRows[0].role === 'admin') {
+            const error = new Error('관리자 계정은 포인트를 변경할 수 없습니다.');
+            error.status = 403;
+            throw error;
+        }
+
+        const pointResult = await adjustUserPointBalance(conn, {
+            userId: targetRows[0].id,
+            amount,
+            transactionType: amount > 0 ? 'admin_grant' : 'admin_deduct',
+            note,
+            referenceType: 'admin',
+            referenceId: req.user.id,
+            createdBy: req.user.id,
+        });
+
+        await conn.commit();
+
+        return res.json({
+            ok: true,
+            pointBalance: pointResult.afterBalance,
+            transactionId: pointResult.transactionId,
+        });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Error adjusting admin user points:', err);
+        res.status(err.status || 500).json({
+            error: err.message || '포인트 조정에 실패했습니다.',
+            code: err.code || null,
+            pointBalance: Number(err.pointBalance || 0),
+            requiredPoints: Number(err.requiredPoints || 0),
+            shortage: Number(err.shortage || 0),
+        });
+    } finally {
+        conn.release();
+    }
+});
+
 router.patch('/users/:id', auth, requireAdmin, async (req, res) => {
     try {
         const userId = req.params.id;
-        const { isPremium, isSuspended } = req.body || {};
+        const { isPremium, isSuspended, canPublishCommunity } = req.body || {};
 
         const [targetRows] = await pool.query('SELECT id, role FROM users WHERE id=? LIMIT 1', [userId]);
         if (!targetRows.length) {
@@ -800,8 +1099,8 @@ router.patch('/users/:id', auth, requireAdmin, async (req, res) => {
         }
 
         await pool.query(
-            'UPDATE users SET is_premium=?, is_suspended=? WHERE id=?',
-            [isPremium ? 1 : 0, isSuspended ? 1 : 0, userId]
+            'UPDATE users SET is_premium=?, is_suspended=?, can_publish_community=? WHERE id=?',
+            [isPremium ? 1 : 0, isSuspended ? 1 : 0, canPublishCommunity ? 1 : 0, userId]
         );
 
         return res.json({ ok: true });

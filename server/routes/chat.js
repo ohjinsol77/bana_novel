@@ -4,6 +4,7 @@ import { appendFile, mkdir } from 'fs/promises';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { adjustUserPointBalance, getChatPointCostForUser, POINT_TOP_UP_OPTIONS } from '../db.js';
 import { formatCharacterPersona, hydrateCharacterRow } from '../persona.js';
 import { resolveSessionUser } from '../session.js';
 
@@ -73,11 +74,19 @@ router.get('/:storyId', auth, async (req, res) => {
 
 // 스토리 한 단락 쓰기(유저) + AI 작가 생성
 router.post('/:storyId', auth, async (req, res) => {
+    const conn = await pool.getConnection();
+    let chargedPoints = 0;
+    let pointChargeTransactionId = null;
+    let remainingPoints = Number(req.user?.point_balance || 0);
+    let transactionCommitted = false;
+    let userMessageSaved = false;
+    let pointsRefunded = false;
     try {
         const { content } = req.body;
         if (!content?.trim()) return res.status(400).json({ error: '내용 없음' });
 
         const storyId = req.params.storyId;
+        const chatCost = getChatPointCostForUser(req.user);
         await writeChatDebugLog({
             event: 'chat_request_received',
             storyId,
@@ -86,7 +95,7 @@ router.post('/:storyId', auth, async (req, res) => {
         });
 
         // 1. 스토리 정보 가져오기
-        const [stories] = await pool.query('SELECT * FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
+        const [stories] = await conn.query('SELECT * FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
         if (!stories.length) {
             await writeChatDebugLog({
                 event: 'chat_story_not_found',
@@ -97,15 +106,32 @@ router.post('/:storyId', auth, async (req, res) => {
         }
         const story = stories[0];
 
+        await conn.beginTransaction();
         // 2. 스토리 내 등장인물 목록 모두 가져오기
-        const [characterRows] = await pool.query('SELECT * FROM story_characters WHERE story_id=?', [storyId]);
+        const [characterRows] = await conn.query('SELECT * FROM story_characters WHERE story_id=?', [storyId]);
         const characters = characterRows.map(hydrateCharacterRow);
 
         // 사용자의 턴 기록 저장
-        await pool.query(
+        await conn.query(
             'INSERT INTO story_messages (story_id, user_id, role, content) VALUES (?,?,?,?)',
             [storyId, req.user.id, 'user', content]
         );
+        userMessageSaved = true;
+        if (chatCost > 0) {
+            const pointResult = await adjustUserPointBalance(conn, {
+                userId: req.user.id,
+                amount: -chatCost,
+                transactionType: 'chat',
+                note: `대화 차감 (${chatCost}P)`,
+                referenceType: 'story',
+                referenceId: Number(storyId),
+            });
+            chargedPoints = chatCost;
+            pointChargeTransactionId = pointResult.transactionId;
+            remainingPoints = pointResult.afterBalance;
+        }
+        await conn.commit();
+        transactionCommitted = true;
 
         // ── AI 작가 응답 생성 ──────────────────────────────────────
         let aiReply;
@@ -266,8 +292,40 @@ router.post('/:storyId', auth, async (req, res) => {
             });
         }
 
+        if (aiReply === GEMINI_FAILURE_MESSAGE && chargedPoints > 0) {
+            const refundConn = await pool.getConnection();
+            try {
+                await refundConn.beginTransaction();
+                const refundResult = await adjustUserPointBalance(refundConn, {
+                    userId: req.user.id,
+                    amount: chargedPoints,
+                    transactionType: 'refund',
+                    note: 'AI 응답 실패 환불',
+                    referenceType: 'story',
+                    referenceId: Number(storyId),
+                    createdBy: null,
+                });
+                await refundConn.commit();
+                remainingPoints = refundResult.afterBalance;
+                pointsRefunded = true;
+            } catch (refundErr) {
+                await refundConn.rollback();
+                console.error('Point refund failed:', refundErr);
+                await writeChatDebugLog({
+                    event: 'chat_refund_failed',
+                    storyId,
+                    userId: req.user.id,
+                    amount: chargedPoints,
+                    chargeTransactionId: pointChargeTransactionId,
+                    error: refundErr?.message || String(refundErr),
+                });
+            } finally {
+                refundConn.release();
+            }
+        }
+
         // AI 생성 문단 저장
-        await pool.query(
+        await conn.query(
             'INSERT INTO story_messages (story_id, user_id, role, content) VALUES (?,?,?,?)',
             [storyId, req.user.id, 'assistant', aiReply]
         );
@@ -279,8 +337,42 @@ router.post('/:storyId', auth, async (req, res) => {
             isFailureMessage: aiReply === GEMINI_FAILURE_MESSAGE,
         });
 
-        res.json({ role: 'assistant', content: aiReply });
+        res.json({
+            role: 'assistant',
+            content: aiReply,
+            remainingPoints,
+            pointsCharged: aiReply === GEMINI_FAILURE_MESSAGE ? 0 : chargedPoints,
+        });
     } catch (err) {
+        try {
+            if (!transactionCommitted && conn && conn.connection && conn.connection._closing !== true) {
+                await conn.rollback();
+            }
+        } catch {
+            // ignore rollback failure
+        }
+        if (transactionCommitted && chargedPoints > 0 && !pointsRefunded) {
+            const refundConn = await pool.getConnection();
+            try {
+                await refundConn.beginTransaction();
+                const refundResult = await adjustUserPointBalance(refundConn, {
+                    userId: req.user.id,
+                    amount: chargedPoints,
+                    transactionType: 'refund',
+                    note: userMessageSaved ? '집필 실패 자동 환불' : '포인트 차감 오류 환불',
+                    referenceType: 'story',
+                    referenceId: Number(req.params.storyId),
+                });
+                await refundConn.commit();
+                remainingPoints = refundResult.afterBalance;
+                pointsRefunded = true;
+            } catch (refundErr) {
+                await refundConn.rollback();
+                console.error('Point rollback refund failed:', refundErr);
+            } finally {
+                refundConn.release();
+            }
+        }
         console.error('Error writing story:', err);
         await writeChatDebugLog({
             event: 'chat_route_exception',
@@ -289,7 +381,20 @@ router.post('/:storyId', auth, async (req, res) => {
             error: err?.message || String(err),
             stack: err?.stack || null,
         });
-        res.status(500).json({ error: '집필 전송 실패' });
+        const isInsufficient = err.code === 'INSUFFICIENT_POINTS' || err.status === 402;
+        res.status(err.status || (isInsufficient ? 402 : 500)).json({
+            error: isInsufficient
+                ? '대화를 위한 포인트가 부족합니다. 충전하시겠습니까?'
+                : (err.message || '집필 전송 실패'),
+            code: err.code || null,
+            pointBalance: Number(err.pointBalance || req.user?.point_balance || 0),
+            requiredPoints: Number(err.requiredPoints || getChatPointCostForUser(req.user)),
+            shortage: Number(err.shortage || 0),
+            topUpOptions: err.topUpOptions || POINT_TOP_UP_OPTIONS,
+            remainingPoints,
+        });
+    } finally {
+        conn.release();
     }
 });
 
@@ -322,6 +427,15 @@ function buildWriterPrompt(story, characters) {
     characters.forEach((c, i) => {
         prompt += `\n[페르소나 ${i + 1}]\n${formatCharacterPersona(c)}\n`;
     });
+
+    const protagonistNames = characters
+        .filter((c) => c.isProtagonist)
+        .map((c) => c.name)
+        .filter(Boolean);
+
+    if (protagonistNames.length) {
+        prompt += `\n<주인공 설정>\n주인공으로 지정된 인물: ${protagonistNames.join(', ')}\n이 인물을 장면의 중심축으로 두고 이야기를 전개하세요.\n`;
+    }
 
     prompt += `
 <집필 규칙>

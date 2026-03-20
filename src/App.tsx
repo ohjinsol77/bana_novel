@@ -3,27 +3,32 @@ import {
     Plus, Settings, Trash2, LogOut,
     ShieldAlert, CreditCard, ChevronLeft, Send, Sparkles,
     BookOpen, Globe, Lock, Users, RefreshCw,
-    BarChart3, Database, MessageSquareText, ScrollText, Search
+    BarChart3, Database, MessageSquareText, ScrollText, Search,
+    WalletCards, Coins, CircleDollarSign
 } from 'lucide-react';
 import {
     fetchMe, fetchStories, createStory, updateStory,
     deleteStory, fetchStoryMessages, sendStoryMessage, clearStoryMessages,
     fetchCommunityStories,
     fetchAdminDashboard, fetchAdminStoryDetail, updateAdminStoryVisibility, reviewAdminStory,
-    deleteAdminStory, updateAdminUser, oauthUrl, updateStorySettings
+    deleteAdminStory, updateAdminUser, oauthUrl, updateStorySettings,
+    fetchMyPoints, topUpPoints, fetchAdminPointDashboard, fetchAdminPointUser, adjustAdminUserPoints
 } from './api';
 import './index.css';
 
 // ── Types ───────────────────────────────────────────────────
 interface AuthUser {
     id: number; name: string; email: string; role: 'user' | 'admin';
-    is_adult: boolean; is_premium: boolean;
+    is_adult: boolean; is_premium: boolean; can_publish_community: boolean; point_balance: number;
 }
+
+type StoryPublicMethod = 'private' | 'request' | 'approved' | 'direct';
 
 export interface StoryCharacter {
     id?: number;
     story_id?: number;
     name: string;
+    isProtagonist: boolean;
     age: number | '';
     gender: string;
     job: string;
@@ -49,6 +54,7 @@ export interface Story {
     environment: string;
     is_public: boolean;
     public_status?: 'private' | 'pending' | 'approved' | 'rejected';
+    public_method?: StoryPublicMethod;
     public_requested_at?: string | null;
     public_reviewed_at?: string | null;
     public_review_message?: string | null;
@@ -67,11 +73,11 @@ export interface StoryMessage {
     created_at: string;
 }
 
-type ViewName = 'login' | 'home' | 'community' | 'studio' | 'chat' | 'admin';
-
-type AdminTab = 'overview' | 'users' | 'stories' | 'messages' | 'requests' | 'public' | 'database';
+type ViewName = 'login' | 'home' | 'community' | 'studio' | 'chat' | 'points' | 'admin';
+type AdminTab = 'overview' | 'users' | 'stories' | 'messages' | 'requests' | 'public' | 'database' | 'points';
 type AdminDatabaseView = 'stats' | 'graph' | 'distribution' | 'filters' | 'tables';
 type AdminSeriesKey = 'users' | 'stories' | 'messages';
+type PointTransactionType = 'welcome' | 'topup' | 'chat' | 'admin_grant' | 'admin_deduct' | 'refund' | 'adjustment';
 
 interface AdminUserRow {
     id: number;
@@ -82,6 +88,8 @@ interface AdminUserRow {
     isAdult: number;
     isPremium: number;
     isSuspended: number;
+    canPublishCommunity: number;
+    pointBalance: number;
     createdAt: string;
 }
 
@@ -92,6 +100,7 @@ interface AdminStoryRow {
     environment: string;
     isPublic: number;
     publicStatus?: 'private' | 'pending' | 'approved' | 'rejected';
+    publicMethod?: StoryPublicMethod;
     coverImageUrl?: string | null;
     publicRequestedAt?: string | null;
     publicReviewedAt?: string | null;
@@ -102,6 +111,71 @@ interface AdminStoryRow {
     authorEmail: string | null;
     characterCount: number;
     messageCount: number;
+}
+
+interface PointTransactionRow {
+    id: number;
+    userId: number;
+    userName?: string | null;
+    userEmail?: string | null;
+    userRole?: string | null;
+    isPremium?: number;
+    amount: number;
+    balanceAfter: number;
+    transactionType: PointTransactionType;
+    note?: string | null;
+    referenceType?: string | null;
+    referenceId?: number | null;
+    createdBy?: number | null;
+    createdAt: string;
+}
+
+interface PointMeData {
+    pointBalance: number;
+    chatCost: number;
+    storyLimit: number;
+    storyCount: number;
+    canCharge: boolean;
+    recentTransactions: PointTransactionRow[];
+}
+
+interface AdminPointDashboard {
+    summary: {
+        userCount: number;
+        premiumUserCount: number;
+        activePointUserCount: number;
+        totalBalance: number;
+        totalInflow: number;
+        totalOutflow: number;
+        welcomeGranted: number;
+        totalTopup: number;
+        chatSpent: number;
+        adminGranted: number;
+        adminDeducted: number;
+        transactionCount: number;
+        transactions24h: number;
+        net24h: number;
+    };
+    ledger: PointTransactionRow[];
+    topUsers: Array<{ id: number; name: string; email: string | null; role: string; isPremium: number; pointBalance: number; createdAt: string }>;
+}
+
+interface AdminPointUserDetail {
+    user: {
+        id: number;
+        name: string;
+        email: string;
+        role: string;
+        provider: string;
+        isAdult: number;
+        isPremium: number;
+        isSuspended: number;
+        canPublishCommunity: number;
+        pointBalance: number;
+        createdAt: string;
+    };
+    storyCount: number;
+    recentTransactions: PointTransactionRow[];
 }
 
 interface AdminMessageRow {
@@ -223,6 +297,7 @@ interface CommunityStoryRow {
     environment: string;
     coverImageUrl?: string | null;
     publicStatus?: 'private' | 'pending' | 'approved' | 'rejected';
+    publicMethod?: StoryPublicMethod;
     isPublic: number;
     createdAt: string;
     updatedAt: string;
@@ -234,7 +309,7 @@ interface AdminStoryDetail {
     story: AdminStoryRow & {
         background: string;
         environment: string;
-        viewer_settings?: Partial<ReaderSettings> | null;
+        viewerSettings?: Partial<ReaderSettings> | null;
         authorRole: string | null;
     };
     characters: StoryCharacter[];
@@ -380,6 +455,7 @@ function isCompactReaderViewport() {
 function createEmptyCharacter(): StoryCharacter {
     return {
         name: '',
+        isProtagonist: false,
         age: '',
         gender: 'other',
         job: '',
@@ -419,6 +495,51 @@ function normalizeStoryForClient(story: Story): Story {
     };
 }
 
+function normalizePublicMethod(value?: string | null): StoryPublicMethod {
+    if (value === 'request' || value === 'approved' || value === 'direct' || value === 'private') return value;
+    return 'private';
+}
+
+function resolveStoryVisibilityInfo(story: { isPublic: number; publicStatus?: string | null; publicMethod?: string | null }) {
+    const status = story.publicStatus || (story.isPublic ? 'approved' : 'private');
+    const method = normalizePublicMethod(story.publicMethod);
+
+    if (status === 'pending') {
+        return { label: '승인 대기', badge: 'badge-gold' };
+    }
+
+    if (status === 'rejected') {
+        return { label: '반려', badge: 'badge-red' };
+    }
+
+    if (status === 'approved') {
+        return method === 'direct'
+            ? { label: '즉시 공개', badge: 'badge-green' }
+            : { label: '공개', badge: 'badge-green' };
+    }
+
+    return { label: '비공개', badge: 'badge-red' };
+}
+
+function canUseDirectPublish(user: AuthUser | null) {
+    return Boolean(user && (user.role === 'admin' || user.can_publish_community));
+}
+
+function getStoryLimitForUser(user: AuthUser | null) {
+    if (user?.role === 'admin' || user?.is_premium) {
+        return 30;
+    }
+    return 3;
+}
+
+function getChatCostForUser(user: AuthUser | null) {
+    return user?.is_premium ? 10 : 15;
+}
+
+function formatPointAmount(value: number | null | undefined) {
+    return `${new Intl.NumberFormat('ko-KR').format(Number(value || 0))}P`;
+}
+
 function limitLongText(value: string) {
     return value.slice(0, LONG_TEXT_LIMIT);
 }
@@ -441,7 +562,7 @@ function getErrorMessage(err: unknown) {
 }
 
 function normalizeView(value: string): ViewName {
-    return value === 'login' || value === 'home' || value === 'community' || value === 'studio' || value === 'chat' || value === 'admin'
+    return value === 'login' || value === 'home' || value === 'community' || value === 'studio' || value === 'chat' || value === 'points' || value === 'admin'
         ? value
         : 'home';
 }
@@ -563,7 +684,7 @@ async function createCoverImageDataUrl(file: File) {
 
 // ── App ─────────────────────────────────────────────────────
 export default function App() {
-    const [user, setUser] = useState<AuthUser | null>({ id: 1, name: '손님', email: 'guest@example.com', role: 'user', is_adult: false, is_premium: false });
+    const [user, setUser] = useState<AuthUser | null>(null);
     const [view, setView] = useState<ViewName>('home');
     const [stories, setStories] = useState<Story[]>([]);
     const [activeStory, setActiveStory] = useState<Story | null>(null);
@@ -598,8 +719,25 @@ export default function App() {
     const [adminRequestPreset, setAdminRequestPreset] = useState<'all' | '7d' | '30d' | 'custom'>('all');
     const [adminRequestStart, setAdminRequestStart] = useState(() => getPresetRange('7d').start);
     const [adminRequestEnd, setAdminRequestEnd] = useState(() => getPresetRange('7d').end);
+    const [pointData, setPointData] = useState<PointMeData | null>(null);
+    const [pointLoading, setPointLoading] = useState(false);
+    const [pointError, setPointError] = useState('');
+    const [pointChargeAmount, setPointChargeAmount] = useState(100);
+    const [pointChargePreset, setPointChargePreset] = useState<100 | 300 | 500 | 1000>(300);
+    const [insufficientPointsOpen, setInsufficientPointsOpen] = useState(false);
+    const [insufficientPointNeed, setInsufficientPointNeed] = useState(0);
+    const [insufficientPointHave, setInsufficientPointHave] = useState(0);
+    const [adminPointDashboard, setAdminPointDashboard] = useState<AdminPointDashboard | null>(null);
+    const [adminPointLoading, setAdminPointLoading] = useState(false);
+    const [adminPointError, setAdminPointError] = useState('');
+    const [adminPointUserDetail, setAdminPointUserDetail] = useState<AdminPointUserDetail | null>(null);
+    const [adminPointUserLoading, setAdminPointUserLoading] = useState(false);
+    const [adminPointAdjustment, setAdminPointAdjustment] = useState('');
+    const [adminPointAdjustmentNote, setAdminPointAdjustmentNote] = useState('');
     const [editMode, setEditMode] = useState<'new' | 'edit'>('new');
     const chatBottomRef = useRef<HTMLDivElement>(null);
+    const pointDataLoadedForUserRef = useRef<number | null>(null);
+    const adminPointDashboardLoadedRef = useRef(false);
 
     // Reader Settings (Restored)
     const [readerSettings, setReaderSettings] = useState<ReaderSettings>({ ...DEFAULT_READER_SETTINGS });
@@ -611,7 +749,7 @@ export default function App() {
 
     // Story form
     const [form, setForm] = useState<Partial<Story>>({
-        title: '', background: '', environment: '', is_public: false,
+        title: '', background: '', environment: '', is_public: false, public_method: 'private',
         characters: []
     });
 
@@ -646,11 +784,13 @@ export default function App() {
 
         fetchMe().then(me => {
             const initialView = window.history.state?.view || (window.location.pathname.replace('/', '') || 'home');
-            if (me) {
-                setUser(me);
+            const isGuestSession = Boolean(me && me.id === 1 && me.name === '손님' && me.email === '' && me.role === 'admin');
+            if (me && !isGuestSession) {
+                setUser({ ...me, point_balance: Number(me.point_balance ?? 0) });
                 setView(normalizeView(String(initialView)));
                 loadStories();
             } else {
+                setUser(null);
                 setView('home');
                 loadStories();
             }
@@ -728,15 +868,134 @@ export default function App() {
         }
     }, []);
 
+    const loadPointData = useCallback(async () => {
+        if (!user) {
+            setPointData(null);
+            return null;
+        }
+
+        try {
+            setPointLoading(true);
+            setPointError('');
+            const data = await fetchMyPoints();
+            const normalized: PointMeData = {
+                pointBalance: Number(data.pointBalance ?? data.point_balance ?? user.point_balance ?? 0),
+                chatCost: Number(data.chatCost ?? data.chat_cost ?? getChatCostForUser(user)),
+                storyLimit: Number(data.storyLimit ?? data.story_limit ?? getStoryLimitForUser(user)),
+                storyCount: Number(data.storyCount ?? data.story_count ?? stories.length),
+                canCharge: Boolean(data.canCharge ?? data.can_charge ?? true),
+                recentTransactions: Array.isArray(data.recentTransactions)
+                    ? data.recentTransactions
+                    : Array.isArray(data.recent_transactions)
+                        ? data.recent_transactions
+                        : [],
+            };
+            setPointData(normalized);
+            setUser((current) => current ? { ...current, point_balance: normalized.pointBalance } : current);
+            return normalized;
+        } catch (err: unknown) {
+            console.error('Load point data failed:', err);
+            setPointError(getErrorMessage(err));
+            throw err;
+        } finally {
+            setPointLoading(false);
+        }
+    }, [user, stories.length]);
+
+    const loadAdminPointDashboard = useCallback(async () => {
+        try {
+            setAdminPointLoading(true);
+            setAdminPointError('');
+            const data = await fetchAdminPointDashboard();
+            const normalized: AdminPointDashboard = {
+                summary: {
+                    userCount: Number(data.summary?.userCount ?? data.summary?.user_count ?? 0),
+                    premiumUserCount: Number(data.summary?.premiumUserCount ?? data.summary?.premium_user_count ?? 0),
+                    activePointUserCount: Number(data.summary?.activePointUserCount ?? data.summary?.active_point_user_count ?? 0),
+                    totalBalance: Number(data.summary?.totalBalance ?? data.summary?.total_balance ?? 0),
+                    totalInflow: Number(data.summary?.totalInflow ?? data.summary?.total_inflow ?? 0),
+                    totalOutflow: Number(data.summary?.totalOutflow ?? data.summary?.total_outflow ?? 0),
+                    welcomeGranted: Number(data.summary?.welcomeGranted ?? data.summary?.welcome_granted ?? 0),
+                    totalTopup: Number(data.summary?.totalTopup ?? data.summary?.total_topup ?? 0),
+                    chatSpent: Number(data.summary?.chatSpent ?? data.summary?.chat_spent ?? 0),
+                    adminGranted: Number(data.summary?.adminGranted ?? data.summary?.admin_granted ?? 0),
+                    adminDeducted: Number(data.summary?.adminDeducted ?? data.summary?.admin_deducted ?? 0),
+                    transactionCount: Number(data.summary?.transactionCount ?? data.summary?.transaction_count ?? 0),
+                    transactions24h: Number(data.summary?.transactions24h ?? data.summary?.transactions_24h ?? 0),
+                    net24h: Number(data.summary?.net24h ?? data.summary?.net_24h ?? 0),
+                },
+                ledger: Array.isArray(data.ledger) ? data.ledger : Array.isArray(data.transactions) ? data.transactions : [],
+                topUsers: Array.isArray(data.topUsers) ? data.topUsers : Array.isArray(data.top_users) ? data.top_users : [],
+            };
+            setAdminPointDashboard(normalized);
+            return normalized;
+        } catch (err: unknown) {
+            console.error('Load admin point dashboard failed:', err);
+            setAdminPointError(getErrorMessage(err));
+            throw err;
+        } finally {
+            setAdminPointLoading(false);
+        }
+    }, []);
+
+    const openAdminPointUser = useCallback(async (userId: number) => {
+        try {
+            setAdminPointUserLoading(true);
+            const detail = await fetchAdminPointUser(userId);
+            setAdminPointUserDetail({
+                user: {
+                    id: Number(detail.user?.id ?? detail.member?.id ?? 0),
+                    name: String(detail.user?.name ?? detail.member?.name ?? '회원'),
+                    email: String(detail.user?.email ?? detail.member?.email ?? ''),
+                    role: String(detail.user?.role ?? detail.member?.role ?? 'user'),
+                    provider: String(detail.user?.provider ?? detail.member?.provider ?? 'local'),
+                    isAdult: Number(detail.user?.isAdult ?? detail.user?.is_adult ?? detail.member?.isAdult ?? detail.member?.is_adult ?? 0),
+                    isPremium: Number(detail.user?.isPremium ?? detail.user?.is_premium ?? detail.member?.isPremium ?? detail.member?.is_premium ?? 0),
+                    isSuspended: Number(detail.user?.isSuspended ?? detail.user?.is_suspended ?? detail.member?.isSuspended ?? detail.member?.is_suspended ?? 0),
+                    canPublishCommunity: Number(detail.user?.canPublishCommunity ?? detail.user?.can_publish_community ?? detail.member?.canPublishCommunity ?? detail.member?.can_publish_community ?? 0),
+                    pointBalance: Number(detail.user?.pointBalance ?? detail.user?.point_balance ?? detail.member?.pointBalance ?? detail.member?.point_balance ?? 0),
+                    createdAt: String(detail.user?.createdAt ?? detail.user?.created_at ?? detail.member?.createdAt ?? detail.member?.created_at ?? ''),
+                },
+                storyCount: Number(detail.storyCount ?? detail.story_count ?? 0),
+                recentTransactions: Array.isArray(detail.recentTransactions)
+                    ? detail.recentTransactions
+                    : Array.isArray(detail.recent_transactions)
+                        ? detail.recent_transactions
+                        : [],
+            });
+            setAdminPointAdjustment('0');
+            setAdminPointAdjustmentNote('');
+        } catch (err: unknown) {
+            console.error('Open admin point user failed:', err);
+            alert(`회원 포인트 정보를 불러올 수 없습니다: ${getErrorMessage(err)}`);
+        } finally {
+            setAdminPointUserLoading(false);
+        }
+    }, []);
+
     const logout = () => {
         localStorage.removeItem('token');
         setUser(null);
+        setPointData(null);
+        setAdminPointDashboard(null);
+        setAdminPointUserDetail(null);
+        pointDataLoadedForUserRef.current = null;
+        adminPointDashboardLoadedRef.current = false;
         navigate('login');
     };
 
     const openNewStory = () => {
+        if (!user) {
+            navigate('login');
+            return;
+        }
+        const storyLimit = getStoryLimitForUser(user);
+        if (stories.length >= storyLimit) {
+            alert(`이야기는 최대 ${storyLimit}개까지 보유할 수 있습니다.`);
+            return;
+        }
         setActiveStory(null);
-        setForm({ title: '', background: '', environment: '', is_public: false, cover_image_url: '', characters: [] });
+        setForm({ title: '', background: '', environment: '', is_public: false, public_method: 'private', cover_image_url: '', characters: [] });
         setEditMode('new');
         navigate('studio');
     };
@@ -750,11 +1009,18 @@ export default function App() {
 
     const openEditStory = (story: Story) => {
         const normalizedStory = normalizeStoryForClient(story);
+        const publicMethod = normalizePublicMethod(
+            normalizedStory.public_method
+                || (normalizedStory.public_status === 'approved' && normalizedStory.is_public ? 'approved' : null)
+                || (normalizedStory.public_status === 'pending' ? 'request' : null)
+                || 'private'
+        );
         setForm({
             title: normalizedStory.title,
             background: normalizedStory.background,
             environment: normalizedStory.environment,
-            is_public: normalizedStory.public_status === 'pending' || normalizedStory.public_status === 'approved' || normalizedStory.is_public,
+            is_public: publicMethod !== 'private',
+            public_method: publicMethod,
             cover_image_url: normalizedStory.cover_image_url || '',
             characters: normalizedStory.characters || [],
         });
@@ -766,6 +1032,10 @@ export default function App() {
     const saveStory = async () => {
         if (!form.title?.trim()) { alert('이야기 제목을 입력하세요'); return; }
         if (form.characters && form.characters.length > 7) { alert('등장인물은 최대 7명까지만 가능합니다.'); return; }
+        if (editMode === 'new' && stories.length >= getStoryLimitForUser(user)) {
+            alert(`이야기는 최대 ${getStoryLimitForUser(user)}개까지 보유할 수 있습니다.`);
+            return;
+        }
 
         try {
             if (editMode === 'new') {
@@ -826,6 +1096,14 @@ export default function App() {
             }
             return;
         }
+        const currentBalance = pointData?.pointBalance ?? user?.point_balance ?? 0;
+        const pointsNeeded = pointData?.chatCost ?? getChatCostForUser(user);
+        if (currentBalance < pointsNeeded) {
+            setInsufficientPointNeed(pointsNeeded);
+            setInsufficientPointHave(currentBalance);
+            setInsufficientPointsOpen(true);
+            return;
+        }
         const content = msgInput;
         const userMessageId = Date.now();
         setMsgInput('');
@@ -837,9 +1115,26 @@ export default function App() {
             const reply = await sendStoryMessage(activeStory.id, content);
             console.info('집필 요청 완료:', { storyId: activeStory.id, hasReply: Boolean(reply?.content) });
             setStoryMessages(prev => [...prev, { id: reply.id ?? Date.now() + 1, story_id: activeStory.id, role: 'assistant', content: reply.content, created_at: '' }]);
+            if (typeof reply.remainingPoints === 'number') {
+                setUser((current) => current ? { ...current, point_balance: reply.remainingPoints } : current);
+                setPointData((current) => current ? {
+                    ...current,
+                    pointBalance: reply.remainingPoints,
+                    recentTransactions: current.recentTransactions,
+                } : current);
+            }
+            void loadPointData().catch(() => undefined);
         } catch (err: unknown) {
             console.error('집필 전송 실패:', err);
             const errorMessage = getErrorMessage(err) || '알 수 없는 오류';
+            const status = err instanceof Error ? (err as Error & { status?: number }).status : undefined;
+            if (status === 402 || /포인트|insufficient/i.test(errorMessage)) {
+                setStoryMessages(prev => prev.filter((message) => message.id !== userMessageId));
+                setInsufficientPointNeed(pointsNeeded);
+                setInsufficientPointHave(currentBalance);
+                setInsufficientPointsOpen(true);
+                return;
+            }
             setStoryMessages(prev => [
                 ...prev,
                 {
@@ -852,6 +1147,29 @@ export default function App() {
             ]);
         } finally {
             setIsSending(false);
+        }
+    };
+
+    const chargePoints = async (amount: number, packageName?: string) => {
+        if (!user) {
+            alert('로그인이 필요합니다.');
+            return;
+        }
+        try {
+            setPointError('');
+            const result = await topUpPoints({ amount, packageName });
+            const nextBalance = Number(result.pointBalance ?? result.point_balance ?? 0);
+            setUser((current) => current ? { ...current, point_balance: nextBalance } : current);
+            setPointData((current) => current ? {
+                ...current,
+                pointBalance: nextBalance,
+                recentTransactions: current.recentTransactions,
+            } : current);
+            await loadPointData().catch(() => undefined);
+            alert(`${formatPointAmount(amount)} 충전이 반영됐습니다.`);
+        } catch (err: unknown) {
+            setPointError(getErrorMessage(err));
+            throw err;
         }
     };
 
@@ -993,6 +1311,20 @@ export default function App() {
         void loadCommunityStories();
     }, [view, communityStories.length, communityLoading, loadCommunityStories]);
 
+    useEffect(() => {
+        if (!user || pointLoading) return;
+        if (pointDataLoadedForUserRef.current === user.id) return;
+        pointDataLoadedForUserRef.current = user.id;
+        void loadPointData();
+    }, [user, pointLoading, loadPointData]);
+
+    useEffect(() => {
+        if (view !== 'admin' || adminTab !== 'points' || adminPointLoading) return;
+        if (adminPointDashboardLoadedRef.current) return;
+        adminPointDashboardLoadedRef.current = true;
+        void loadAdminPointDashboard();
+    }, [view, adminTab, adminPointLoading, loadAdminPointDashboard]);
+
     const openAdminStoryDetail = async (storyId: number) => {
         try {
             setAdminStoryLoading(true);
@@ -1085,13 +1417,16 @@ export default function App() {
         }
     };
 
-    const updateAdminUserStatus = async (userId: number, patch: { isPremium?: boolean; isSuspended?: boolean }) => {
+    const updateAdminUserStatus = async (userId: number, patch: { isPremium?: boolean; isSuspended?: boolean; canPublishCommunity?: boolean }) => {
         const isPremium = patch.isPremium ?? undefined;
         const isSuspended = patch.isSuspended ?? undefined;
+        const canPublishCommunity = patch.canPublishCommunity ?? undefined;
         const confirmText =
             isSuspended !== undefined
                 ? `회원을 ${isSuspended ? '정지' : '정지 해제'}할까요?`
-                : `프리미엄 상태를 ${isPremium ? '켜기' : '끄기'}로 바꿀까요?`;
+                : canPublishCommunity !== undefined
+                    ? `커뮤니티 공개 권한을 ${canPublishCommunity ? '부여' : '회수'}할까요?`
+                    : `프리미엄 상태를 ${isPremium ? '켜기' : '끄기'}로 바꿀까요?`;
         if (!confirm(confirmText)) return;
 
         try {
@@ -1100,11 +1435,46 @@ export default function App() {
             await updateAdminUser(userId, {
                 isPremium: isPremium ?? currentUser?.isPremium ?? false,
                 isSuspended: isSuspended ?? currentUser?.isSuspended ?? false,
+                canPublishCommunity: canPublishCommunity ?? currentUser?.canPublishCommunity ?? false,
             });
             await refreshAdminData();
+            if (adminTab === 'points') {
+                await loadAdminPointDashboard().catch(() => undefined);
+            }
+            if (adminPointUserDetail?.user.id === userId) {
+                await openAdminPointUser(userId);
+            }
         } catch (err: unknown) {
             console.error('Update admin user failed:', err);
             alert(`회원 상태 변경 실패: ${getErrorMessage(err)}`);
+        } finally {
+            setAdminMutation(null);
+        }
+    };
+
+    const handleAdminPointAdjustment = async () => {
+        if (!adminPointUserDetail) return;
+        const amount = Math.trunc(Number(adminPointAdjustment));
+        if (!Number.isFinite(amount) || amount === 0) {
+            alert('지급은 양수, 회수는 음수로 입력해주세요.');
+            return;
+        }
+
+        try {
+            setAdminMutation(`point:${adminPointUserDetail.user.id}`);
+            await adjustAdminUserPoints(adminPointUserDetail.user.id, {
+                amount,
+                note: adminPointAdjustmentNote.trim() || '관리자 수동 조정',
+            });
+            await refreshAdminData();
+            await loadAdminPointDashboard().catch(() => undefined);
+            await openAdminPointUser(adminPointUserDetail.user.id);
+            if (user?.id === adminPointUserDetail.user.id) {
+                await loadPointData().catch(() => undefined);
+            }
+        } catch (err: unknown) {
+            console.error('Adjust admin user points failed:', err);
+            alert(`포인트 조정 실패: ${getErrorMessage(err)}`);
         } finally {
             setAdminMutation(null);
         }
@@ -1119,6 +1489,9 @@ export default function App() {
             </div>
             {user && (
                 <div className="nav-actions">
+                    <button className="btn btn-outline" style={{ fontSize: '0.85rem', padding: '0.4rem 0.8rem' }} onClick={() => navigate('points')}>
+                        <Coins size={16} /> 포인트 {formatPointAmount(pointData?.pointBalance ?? user.point_balance)}
+                    </button>
                     {user.role === 'admin' && (
                         <button className="btn btn-outline" style={{ fontSize: '0.85rem', padding: '0.4rem 0.8rem' }} onClick={openAdmin}>
                             <ShieldAlert size={16} /> 관리자
@@ -1173,16 +1546,59 @@ export default function App() {
     // ── Home: story list ─────────────────────────────────
     const renderHome = () => (
         <div className="main-content fade-in">
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
-                <div>
+            <div className="home-hero glass-panel" style={{ marginBottom: '1rem' }}>
+                <div className="home-hero-copy">
                     <h1 className="title-font" style={{ fontSize: '1.8rem' }}>나의 소설</h1>
-                    <p className="text-muted" style={{ fontSize: '0.9rem' }}>
+                    <p className="text-muted" style={{ fontSize: '0.9rem', marginTop: '0.35rem' }}>
                         새로운 세계관과 인물을 만들고 이야기를 이어 써보세요
                     </p>
                 </div>
-                <button className="btn btn-primary" onClick={openNewStory}>
-                    <Plus size={18} /> 새 이야기
-                </button>
+                <div className="home-hero-actions">
+                    {user ? (
+                        <>
+                            <button className="btn btn-outline" onClick={() => navigate('points')}>
+                                <Coins size={16} /> 충전하기
+                            </button>
+                            <button className="btn btn-primary" onClick={openNewStory} disabled={stories.length >= getStoryLimitForUser(user)}>
+                                <Plus size={18} /> 새 이야기
+                            </button>
+                        </>
+                    ) : (
+                        <button className="btn btn-primary" onClick={() => navigate('login')}>
+                            <Users size={18} /> 로그인
+                        </button>
+                    )}
+                </div>
+            </div>
+
+            <div className="home-stats-grid" style={{ marginBottom: '1rem' }}>
+                <div className="glass-panel home-stat-card">
+                    <div className="home-stat-head">
+                        <span className="badge badge-gold">포인트</span>
+                        <Coins size={18} className="text-accent" />
+                    </div>
+                    <strong className="home-stat-value">{formatPointAmount(pointData?.pointBalance ?? user?.point_balance ?? 0)}</strong>
+                    <p className="text-muted">대화 1회당 {formatPointAmount(pointData?.chatCost ?? getChatCostForUser(user))} 차감됩니다.</p>
+                    <button
+                        className="btn btn-outline"
+                        style={{ marginTop: '0.85rem', width: '100%' }}
+                        onClick={() => navigate(user ? 'points' : 'login')}
+                    >
+                        {user ? '포인트 충전' : '로그인 후 충전'}
+                    </button>
+                </div>
+                <div className="glass-panel home-stat-card">
+                    <div className="home-stat-head">
+                        <span className="badge badge-green">이야기 보유</span>
+                        <BookOpen size={18} className="text-accent" />
+                    </div>
+                    <strong className="home-stat-value">{stories.length} / {getStoryLimitForUser(user)}</strong>
+                    <p className="text-muted">
+                        {stories.length >= getStoryLimitForUser(user)
+                            ? '보유 개수에 도달했습니다. 기존 이야기를 정리하거나 프리미엄을 확인해보세요.'
+                            : '이야기는 무료로 만들 수 있습니다. 프리미엄은 30개, 일반 회원은 3개까지 보유할 수 있어요.'}
+                    </p>
+                </div>
             </div>
 
             {stories.length === 0 ? (
@@ -1210,13 +1626,11 @@ export default function App() {
                                         ? <Globe size={14} className="text-muted" />
                                         : <Lock size={14} className="text-muted" />}
                                     <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-                                        {story.public_status === 'approved'
-                                            ? '공개'
-                                            : story.public_status === 'pending'
-                                                ? '승인 대기'
-                                                : story.public_status === 'rejected'
-                                                    ? '반려'
-                                                    : '비공개'}
+                                        {resolveStoryVisibilityInfo({
+                                            isPublic: story.is_public ? 1 : 0,
+                                            publicStatus: story.public_status || null,
+                                            publicMethod: story.public_method || null,
+                                        }).label}
                                     </span>
                                 </div>
                                 {story.public_status === 'rejected' && story.public_review_message && (
@@ -1277,7 +1691,7 @@ export default function App() {
                                     <h1 className="title-font" style={{ fontSize: '1.6rem' }}>커뮤니티</h1>
                                 </div>
                                 <p className="text-muted" style={{ marginTop: '0.5rem' }}>
-                                    관리자 승인을 받은 공개 작품만 모아 봅니다.
+                                    관리자 승인 공개와 직접 공개 작품을 함께 모아 봅니다.
                                 </p>
                             </div>
                             <div className="admin-hero-actions">
@@ -1355,7 +1769,17 @@ export default function App() {
                                                         {story.authorName || '알 수 없음'} · {story.environment || '환경 미설정'}
                                                     </p>
                                                 </div>
-                                                <span className="badge badge-green">공개</span>
+                                                <span className={`badge ${resolveStoryVisibilityInfo({
+                                                    isPublic: story.isPublic,
+                                                    publicStatus: story.publicStatus || null,
+                                                    publicMethod: story.publicMethod || null,
+                                                }).badge}`}>
+                                                    {resolveStoryVisibilityInfo({
+                                                        isPublic: story.isPublic,
+                                                        publicStatus: story.publicStatus || null,
+                                                        publicMethod: story.publicMethod || null,
+                                                    }).label}
+                                                </span>
                                             </div>
                                             <p className="community-card-text">
                                                 {story.background || '배경 설명이 없습니다.'}
@@ -1374,6 +1798,178 @@ export default function App() {
             })()}
         </div>
     );
+
+    const renderPoints = () => {
+        const pointBalance = pointData?.pointBalance ?? user?.point_balance ?? 0;
+        const chatCost = pointData?.chatCost ?? getChatCostForUser(user);
+        const storyLimit = pointData?.storyLimit ?? getStoryLimitForUser(user);
+        const storyCount = pointData?.storyCount ?? stories.length;
+        const quickPackages = [100, 300, 500, 1000] as const;
+        const transactions = pointData?.recentTransactions || [];
+        const formatTransactionLabel = (type: PointTransactionType) => {
+            switch (type) {
+                case 'welcome': return '웰컴';
+                case 'topup': return '충전';
+                case 'chat': return '대화 차감';
+                case 'admin_grant': return '관리자 지급';
+                case 'admin_deduct': return '관리자 회수';
+                case 'refund': return '환불';
+                default: return '조정';
+            }
+        };
+        const formatTxDate = (value: string) => {
+            const date = new Date(value);
+            return Number.isNaN(date.getTime())
+                ? '-'
+                : date.toLocaleString('ko-KR', {
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                });
+        };
+
+        return (
+            <div className="main-content fade-in">
+                <div className="admin-hero glass-panel" style={{ marginBottom: '1rem' }}>
+                    <div>
+                        <div className="admin-hero-title">
+                            <Coins size={22} className="text-accent" />
+                            <h1 className="title-font" style={{ fontSize: '1.6rem' }}>포인트 충전</h1>
+                        </div>
+                        <p className="text-muted" style={{ marginTop: '0.5rem' }}>
+                            대화와 관리에 필요한 포인트를 여기서 충전하고, 사용 내역도 함께 확인하세요.
+                        </p>
+                    </div>
+                    <div className="admin-hero-actions">
+                        <button className="btn btn-outline" onClick={() => navigate('home')}>
+                            <ChevronLeft size={16} /> 내 작품
+                        </button>
+                        <button className="btn btn-primary" onClick={() => void loadPointData()} disabled={pointLoading}>
+                            <RefreshCw size={16} /> 새로고침
+                        </button>
+                    </div>
+                </div>
+
+                {pointError && (
+                    <div className="glass-panel" style={{ borderColor: '#ef4444', background: 'rgba(239,68,68,0.08)', marginBottom: '1rem' }}>
+                        <strong>포인트 정보를 불러오지 못했습니다</strong>
+                        <p className="text-muted" style={{ marginTop: '0.35rem' }}>{pointError}</p>
+                    </div>
+                )}
+
+                <div className="points-summary-grid">
+                    <div className="glass-panel points-metric-card">
+                        <span className="badge badge-gold">현재 포인트</span>
+                        <strong>{formatPointAmount(pointBalance)}</strong>
+                        <p className="text-muted">회원가입 시 {formatPointAmount(50)} 웰컴 포인트를 제공합니다.</p>
+                    </div>
+                    <div className="glass-panel points-metric-card">
+                        <span className="badge badge-green">대화 비용</span>
+                        <strong>{formatPointAmount(chatCost)}</strong>
+                        <p className="text-muted">{user?.is_premium ? '프리미엄 회원 요금' : '일반 회원 요금'}</p>
+                    </div>
+                    <div className="glass-panel points-metric-card">
+                        <span className="badge badge-green">이야기 보유</span>
+                        <strong>{storyCount} / {storyLimit}</strong>
+                        <p className="text-muted">{storyLimit - storyCount > 0 ? `추가로 ${storyLimit - storyCount}개 더 만들 수 있어요.` : '보유 개수 한도에 도달했습니다.'}</p>
+                    </div>
+                </div>
+
+                <div className="points-layout">
+                    <div className="glass-panel points-panel">
+                        <div className="section-title-row">
+                            <h2 className="section-title">빠른 충전</h2>
+                            <span className="section-limit">즉시 반영</span>
+                        </div>
+                        <div className="points-package-grid">
+                            {quickPackages.map((amount) => (
+                                <button
+                                    key={amount}
+                                    className={`points-package ${pointChargePreset === amount ? 'is-active' : ''}`}
+                                    onClick={() => {
+                                        setPointChargePreset(amount);
+                                        setPointChargeAmount(amount);
+                                    }}
+                                >
+                                    <strong>{formatPointAmount(amount)}</strong>
+                                    <span>{amount >= 500 ? '가성비 좋은 충전' : amount >= 300 ? '추천' : '가볍게 충전'}</span>
+                                </button>
+                            ))}
+                        </div>
+
+                        <div className="input-group" style={{ marginTop: '1.2rem' }}>
+                            <label>직접 입력</label>
+                            <input
+                                type="number"
+                                min="50"
+                                step="50"
+                                className="input-control"
+                                value={pointChargeAmount}
+                                onChange={(e) => setPointChargeAmount(Math.max(50, Math.floor(Number(e.target.value) || 0)))}
+                            />
+                            <p className="input-help">최소 50포인트부터 충전할 수 있습니다.</p>
+                        </div>
+
+                        <button
+                            className="btn btn-primary"
+                            style={{ width: '100%', justifyContent: 'center' }}
+                            onClick={() => void chargePoints(pointChargeAmount, `포인트 충전 ${formatPointAmount(pointChargeAmount)}`)}
+                            disabled={pointLoading}
+                        >
+                            <CreditCard size={16} /> {formatPointAmount(pointChargeAmount)} 충전하기
+                        </button>
+
+                        <div className="points-note glass-panel" style={{ marginTop: '1rem' }}>
+                            <strong>대화 안내</strong>
+                            <p className="text-muted" style={{ marginTop: '0.4rem', lineHeight: 1.6 }}>
+                                대화를 시작하기 전 포인트가 부족하면 안내 팝업이 열리고, 충전 페이지로 바로 이동할 수 있습니다.
+                            </p>
+                        </div>
+                    </div>
+
+                    <div className="glass-panel points-panel">
+                        <div className="section-title-row">
+                            <h2 className="section-title">최근 내역</h2>
+                            <span className="section-limit">{transactions.length}건</span>
+                        </div>
+                        {pointLoading && !pointData ? (
+                            <div className="points-empty-state">
+                                <p className="text-muted">포인트 정보를 불러오는 중입니다...</p>
+                            </div>
+                        ) : transactions.length === 0 ? (
+                            <div className="points-empty-state">
+                                <p className="text-muted">아직 포인트 내역이 없습니다.</p>
+                            </div>
+                        ) : (
+                            <div className="points-ledger">
+                                {transactions.map((tx) => {
+                                    const amountLabel = tx.amount > 0 ? `+${formatPointAmount(tx.amount)}` : formatPointAmount(tx.amount);
+                                    const isPositive = tx.amount > 0;
+                                    return (
+                                        <div key={tx.id} className="points-ledger-item">
+                                            <div>
+                                                <div className="points-ledger-head">
+                                                    <strong>{formatTransactionLabel(tx.transactionType)}</strong>
+                                                    <span className={isPositive ? 'text-positive' : 'text-negative'}>{amountLabel}</span>
+                                                </div>
+                                                <p className="text-muted points-ledger-note">{tx.note || '세부 메모 없음'}</p>
+                                            </div>
+                                            <div className="points-ledger-meta">
+                                                <span>{formatTxDate(tx.createdAt)}</span>
+                                                <span>잔액 {formatPointAmount(tx.balanceAfter)}</span>
+                                            </div>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+        );
+    };
 
     // ── Studio: story & character creation/edit ──────────────────────
     const renderStudio = () => {
@@ -1396,6 +1992,16 @@ export default function App() {
                 ...prev,
                 characters: (prev.characters || []).filter((_, i) => i !== index)
             }));
+        };
+
+        const handleSetProtagonist = (index: number) => {
+            setForm((prev) => {
+                const nextCharacters = (prev.characters || []).map((char, currentIndex) => ({
+                    ...char,
+                    isProtagonist: currentIndex === index ? !char.isProtagonist : false,
+                }));
+                return { ...prev, characters: nextCharacters };
+            });
         };
 
         const handleCharChange = <K extends keyof StoryCharacter>(index: number, field: K, value: StoryCharacter[K]) => {
@@ -1492,6 +2098,7 @@ export default function App() {
         );
 
         const canEditCover = editMode === 'edit' && activeStory?.public_status === 'approved';
+        const canDirectPublish = canUseDirectPublish(user);
         const currentCoverImage = typeof form.cover_image_url === 'string' && form.cover_image_url
             ? form.cover_image_url
             : activeStory?.cover_image_url || '';
@@ -1499,7 +2106,7 @@ export default function App() {
         const handleCoverUpload = async (file?: File | null) => {
             if (!file) return;
             if (!canEditCover) {
-                alert('표지는 작품이 공개 승인된 뒤에만 등록할 수 있습니다.');
+                alert('표지는 작품이 공개된 뒤에만 등록할 수 있습니다.');
                 return;
             }
 
@@ -1523,6 +2130,18 @@ export default function App() {
                     <button className="btn btn-primary" onClick={saveStory}>
                         <Sparkles size={16} /> 저장
                     </button>
+                </div>
+
+                <div className="glass-panel home-limit-banner" style={{ marginBottom: '1rem' }}>
+                    <div>
+                        <strong>이야기 보유 한도</strong>
+                        <p className="text-muted" style={{ marginTop: '0.35rem' }}>
+                            일반 회원은 3개, 프리미엄 회원은 30개까지 무료로 이야기와 주인공을 만들 수 있습니다.
+                        </p>
+                    </div>
+                    <span className={`badge ${stories.length >= getStoryLimitForUser(user) ? 'badge-red' : 'badge-green'}`}>
+                        {stories.length} / {getStoryLimitForUser(user)}
+                    </span>
                 </div>
 
                 <div className="studio-layout">
@@ -1553,13 +2172,31 @@ export default function App() {
                         </div>
 
                         <div className="input-group" style={{ marginBottom: 0 }}>
-                            <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                                <input type="checkbox" checked={form.is_public}
-                                    onChange={e => setForm({ ...form, is_public: e.target.checked })} />
-                                커뮤니티 공개 요청
-                            </label>
+                            <label>공개 방식</label>
+                            <select
+                                className="input-control"
+                                value={form.public_method || 'private'}
+                                onChange={(e) => {
+                                    const next = e.target.value as StoryPublicMethod;
+                                    if (next === 'direct' && !canDirectPublish) return;
+                                    setForm({
+                                        ...form,
+                                        public_method: next,
+                                        is_public: next === 'approved' || next === 'direct',
+                                    });
+                                }}
+                            >
+                                <option value="private">비공개</option>
+                                <option value="request">관리자 승인 요청</option>
+                                <option value="direct" disabled={!canDirectPublish}>
+                                    즉시 커뮤니티 공개{canDirectPublish ? '' : ' (권한 필요)'}
+                                </option>
+                                {editMode === 'edit' && activeStory?.public_status === 'approved' && (
+                                    <option value="approved">승인 공개 유지</option>
+                                )}
+                            </select>
                             <p className="input-help" style={{ marginTop: '0.45rem' }}>
-                                체크하면 관리자의 승인을 요청합니다. 승인 전에는 커뮤니티에 보이지 않습니다.
+                                승인 요청은 관리자 검토 후 커뮤니티에 노출됩니다. 권한이 있으면 즉시 공개도 선택할 수 있습니다.
                             </p>
                         </div>
 
@@ -1571,7 +2208,7 @@ export default function App() {
                                     style={{ backgroundImage: currentCoverImage ? `url(${currentCoverImage})` : 'linear-gradient(180deg, #f7efe2 0%, #e7d7bc 100%)' }}
                                 >
                                     {!currentCoverImage && (
-                                        <span>{canEditCover ? '표지를 업로드해주세요' : '공개 승인 후 등록 가능'}</span>
+                                        <span>{canEditCover ? '표지를 업로드해주세요' : '공개 후 등록 가능'}</span>
                                     )}
                                 </div>
                                 <div className="story-cover-actions">
@@ -1600,7 +2237,7 @@ export default function App() {
                             </div>
                             {!canEditCover && (
                                 <p className="input-help" style={{ marginTop: '0.5rem' }}>
-                                    표지는 작품이 공개 승인된 뒤에만 추가할 수 있습니다.
+                                    표지는 작품이 공개된 뒤에만 추가할 수 있습니다.
                                 </p>
                             )}
                         </div>
@@ -1629,7 +2266,17 @@ export default function App() {
                                         style={{ position: 'absolute', top: '1rem', right: '1rem', background: 'none', border: 'none', color: '#f87171', cursor: 'pointer' }}>
                                         <Trash2 size={18} />
                                     </button>
-                                    <h3 style={{ marginBottom: '1rem', fontSize: '1rem', color: 'var(--accent)' }}>등장인물 {index + 1}</h3>
+                                    <div className="character-head-row">
+                                        <h3 style={{ marginBottom: 0, fontSize: '1rem', color: 'var(--accent)' }}>등장인물 {index + 1}</h3>
+                                        <button
+                                            type="button"
+                                            className={`btn btn-outline character-protagonist-btn ${char.isProtagonist ? 'is-active' : ''}`}
+                                            onClick={() => handleSetProtagonist(index)}
+                                        >
+                                            {char.isProtagonist ? '주인공' : '주인공으로 지정'}
+                                        </button>
+                                    </div>
+                                    {char.isProtagonist && <span className="badge badge-gold character-protagonist-badge">주인공</span>}
 
                                     <div className="character-section">
                                         <h4 className="section-title">기본</h4>
@@ -1825,7 +2472,12 @@ export default function App() {
                             {activeStory?.title}
                         </div>
                     </div>
-                    <div style={{ display: 'flex', gap: '0.5rem', position: 'relative' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                        <button className="btn btn-outline" style={{ padding: '0.42rem 0.8rem', fontSize: '0.78rem' }} onClick={() => navigate('points')}>
+                            <Coins size={14} /> 포인트 {formatPointAmount(pointData?.pointBalance ?? user?.point_balance ?? 0)}
+                        </button>
+                        <span className="badge badge-gold">대화 {formatPointAmount(pointData?.chatCost ?? getChatCostForUser(user))}</span>
+                        <div style={{ display: 'flex', gap: '0.5rem', position: 'relative' }}>
                         <button className="btn-icon" onClick={() => setShowSettingsDrawer(!showSettingsDrawer)}>
                             <Settings size={20} />
                         </button>
@@ -1917,6 +2569,7 @@ export default function App() {
                                 </div>
                             </div>
                         )}
+                        </div>
                     </div>
                 </div>
 
@@ -2008,6 +2661,42 @@ export default function App() {
                     </div>
                     <button className="prompt-send-btn" onClick={handleSend} disabled={isSending}><Send size={20} /></button>
                 </div>
+
+                {insufficientPointsOpen && (
+                    <div className="modal-overlay" onClick={() => setInsufficientPointsOpen(false)}>
+                        <div className="modal-content points-modal" onClick={(e) => e.stopPropagation()}>
+                            <div className="points-modal-icon">
+                                <WalletCards size={26} />
+                            </div>
+                            <h2 className="title-font">포인트가 부족합니다</h2>
+                            <p className="text-muted" style={{ lineHeight: 1.7, textAlign: 'center' }}>
+                                대화를 위한 포인트가 부족합니다 충전하시겠습니까?
+                            </p>
+                            <div className="points-modal-summary">
+                                <div>
+                                    <span>보유</span>
+                                    <strong>{formatPointAmount(insufficientPointHave)}</strong>
+                                </div>
+                                <div>
+                                    <span>필요</span>
+                                    <strong>{formatPointAmount(insufficientPointNeed)}</strong>
+                                </div>
+                            </div>
+                            <div className="points-modal-actions">
+                                <button className="btn btn-outline" onClick={() => setInsufficientPointsOpen(false)}>나중에</button>
+                                <button
+                                    className="btn btn-primary"
+                                    onClick={() => {
+                                        setInsufficientPointsOpen(false);
+                                        navigate('points');
+                                    }}
+                                >
+                                    충전하러 가기
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
             </div>
         );
     };
@@ -2017,6 +2706,10 @@ export default function App() {
         const dashboard = adminDashboard;
         const summary = dashboard?.summary;
         const databaseStats = dashboard?.databaseStats;
+        const pointDashboard = adminPointDashboard;
+        const pointSummary = pointDashboard?.summary;
+        const pointLedger = pointDashboard?.ledger || [];
+        const pointTopUsers = pointDashboard?.topUsers || [];
         const query = adminQuery.trim().toLowerCase();
         const numberFmt = new Intl.NumberFormat('ko-KR');
         const formatCount = (value: number | null | undefined) => numberFmt.format(Number(value || 0));
@@ -2089,22 +2782,9 @@ export default function App() {
             return index === 0 || index === periodUsage.length - 1 || index % Math.ceil(periodUsage.length / 4) === 0;
         });
         const chartRangeLabel = selectedRange?.label || '기간을 선택하세요';
-        const resolveStoryStatus = (story: { isPublic: number; publicStatus?: string | null; publicReviewMessage?: string | null }) => {
-            const status = story.publicStatus || (story.isPublic ? 'approved' : 'private');
-            const label = status === 'approved'
-                ? '공개'
-                : status === 'pending'
-                    ? '승인 대기'
-                    : status === 'rejected'
-                        ? '반려'
-                        : '비공개';
-            const badge = status === 'approved'
-                ? 'badge-green'
-                : status === 'pending'
-                    ? 'badge-gold'
-                    : 'badge-red';
-            return { status, label, badge };
-        };
+        const resolveStoryStatus = (story: { isPublic: number; publicStatus?: string | null; publicMethod?: string | null; publicReviewMessage?: string | null }) => (
+            resolveStoryVisibilityInfo(story)
+        );
 
         const filteredUsers = (dashboard?.users || []).filter((u) =>
             !query || [u.name, u.email, u.provider, u.role, u.id].some(includesQuery)
@@ -2130,6 +2810,9 @@ export default function App() {
         const filteredPublicStories = (dashboard?.publicStories || []).filter((story) =>
             !query || [story.title, story.background, story.environment, story.authorName, story.id].some(includesQuery)
         );
+        const filteredPointLedger = pointLedger.filter((row) =>
+            !query || [row.userName, row.userEmail, row.transactionType, row.note, row.amount, row.balanceAfter, row.id].some(includesQuery)
+        );
 
         const tabs: { key: AdminTab; label: string; icon: JSX.Element }[] = [
             { key: 'overview', label: '개요', icon: <BarChart3 size={16} /> },
@@ -2138,6 +2821,7 @@ export default function App() {
             { key: 'requests', label: `승인 요청${summary?.publicRequestCount ? ` (${formatCount(summary.publicRequestCount)})` : ''}`, icon: <ShieldAlert size={16} /> },
             { key: 'messages', label: '메시지', icon: <MessageSquareText size={16} /> },
             { key: 'public', label: '공개작', icon: <Globe size={16} /> },
+            { key: 'points', label: '포인트', icon: <Coins size={16} /> },
             { key: 'database', label: 'DB 상태', icon: <Database size={16} /> },
         ];
 
@@ -2320,22 +3004,36 @@ export default function App() {
                         <div className="admin-table-wrap">
                             <table className="admin-table admin-users-table">
                                 <thead>
-                                    <tr><th>ID</th><th>이름</th><th>이메일</th><th>로그인</th><th>역할</th><th>상태</th><th>프리미엄</th><th>작업</th><th>가입일</th></tr>
+                                    <tr><th>ID</th><th>이름</th><th>역할</th><th>상태</th><th>포인트</th><th>공개권한</th><th>작업</th><th>가입일</th></tr>
                                 </thead>
                                 <tbody>
                                     {filteredUsers.map((u) => (
                                         <tr key={u.id}>
-                                            <td className="text-muted">{u.id}</td>
-                                            <td>{u.name}</td>
-                                            <td className="text-muted">{u.email}</td>
-                                            <td><span className="badge badge-green">{u.provider}</span></td>
+                                            <td>
+                                                <button
+                                                    className="admin-user-id-btn"
+                                                    onClick={() => void openAdminPointUser(u.id)}
+                                                    disabled={adminPointUserLoading}
+                                                >
+                                                    #{u.id}
+                                                </button>
+                                            </td>
+                                            <td>
+                                                <strong>{u.name}</strong>
+                                                <div className="text-muted" style={{ fontSize: '0.78rem', marginTop: '0.2rem' }}>
+                                                    {u.provider}
+                                                </div>
+                                            </td>
                                             <td><span className={`badge ${u.role === 'admin' ? 'badge-red' : 'badge-green'}`}>{u.role}</span></td>
                                             <td>
                                                 <span className={`badge ${u.isSuspended ? 'badge-red' : 'badge-green'}`}>
                                                     {u.isSuspended ? '정지' : '정상'}
                                                 </span>
                                             </td>
-                                            <td>{u.isPremium ? '✅' : '—'}</td>
+                                            <td>
+                                                <span className="badge badge-gold">{formatPointAmount(u.pointBalance)}</span>
+                                            </td>
+                                            <td>{u.canPublishCommunity ? '✅' : '—'}</td>
                                             <td>
                                                 <div className="admin-row-actions">
                                                     <button
@@ -2346,11 +3044,25 @@ export default function App() {
                                                         {u.isPremium ? '프리미엄 끄기' : '프리미엄 켜기'}
                                                     </button>
                                                     <button
+                                                        className="btn btn-outline admin-inline-btn"
+                                                        onClick={() => updateAdminUserStatus(u.id, { canPublishCommunity: !u.canPublishCommunity })}
+                                                        disabled={u.role === 'admin' || adminMutation === `user:${u.id}`}
+                                                    >
+                                                        {u.canPublishCommunity ? '공개권한 회수' : '공개권한 부여'}
+                                                    </button>
+                                                    <button
                                                         className={`btn btn-outline admin-inline-btn ${u.isSuspended ? 'is-danger' : ''}`}
                                                         onClick={() => updateAdminUserStatus(u.id, { isSuspended: !u.isSuspended })}
                                                         disabled={u.role === 'admin' || adminMutation === `user:${u.id}`}
                                                     >
                                                         {u.isSuspended ? '정지 해제' : '정지'}
+                                                    </button>
+                                                    <button
+                                                        className="btn btn-outline admin-inline-btn"
+                                                        onClick={() => void openAdminPointUser(u.id)}
+                                                        disabled={adminPointUserLoading}
+                                                    >
+                                                        {adminPointUserLoading ? '불러오는 중' : '상세'}
                                                     </button>
                                                 </div>
                                             </td>
@@ -2656,6 +3368,108 @@ export default function App() {
                                 </div>
                             ))}
                             {filteredPublicStories.length === 0 && <p className="text-muted">공개된 이야기가 없습니다.</p>}
+                        </div>
+                    </div>
+                )}
+
+                {adminTab === 'points' && (
+                    <div className="admin-points-shell">
+                        <div className="glass-panel admin-points-hero">
+                            <div>
+                                <div className="admin-hero-title">
+                                    <Coins size={22} className="text-accent" />
+                                    <h2 className="section-title" style={{ marginBottom: 0 }}>포인트 관리</h2>
+                                </div>
+                                <p className="text-muted" style={{ marginTop: '0.5rem' }}>
+                                    충전, 지급, 회수, 사용 흐름을 확인하고 회원별 잔액을 조정할 수 있습니다.
+                                </p>
+                            </div>
+                            <div className="admin-hero-actions">
+                                <button className="btn btn-outline" onClick={() => void loadAdminPointDashboard()} disabled={adminPointLoading}>
+                                    <RefreshCw size={16} /> 새로고침
+                                </button>
+                            </div>
+                        </div>
+
+                        {adminPointError && (
+                            <div className="glass-panel" style={{ borderColor: '#ef4444', background: 'rgba(239,68,68,0.08)' }}>
+                                <strong>포인트 대시보드 불러오기 실패</strong>
+                                <p className="text-muted" style={{ marginTop: '0.35rem' }}>{adminPointError}</p>
+                            </div>
+                        )}
+
+                        <div className="admin-summary-grid">
+                            {[
+                                { label: '총 잔액', value: pointSummary?.totalBalance ?? 0, sub: `회원 ${pointSummary?.userCount ?? 0}명` },
+                                { label: '총 유입', value: pointSummary?.totalInflow ?? 0, sub: `충전 ${formatPointAmount(pointSummary?.totalTopup ?? 0)}` },
+                                { label: '총 유출', value: pointSummary?.totalOutflow ?? 0, sub: `대화 ${formatPointAmount(pointSummary?.chatSpent ?? 0)}` },
+                                { label: '웰컴 지급', value: pointSummary?.welcomeGranted ?? 0, sub: '회원가입 첫 지급' },
+                                { label: '관리자 지급', value: pointSummary?.adminGranted ?? 0, sub: `회수 ${formatPointAmount(pointSummary?.adminDeducted ?? 0)}` },
+                                { label: '24시간 변동', value: pointSummary?.net24h ?? 0, sub: `최근 ${pointSummary?.transactions24h ?? 0}건` },
+                            ].map((card) => (
+                                <div key={card.label} className="admin-metric-card glass-panel">
+                                    <p className="admin-metric-label">{card.label}</p>
+                                    <div className="admin-metric-value">{formatPointAmount(card.value as number)}</div>
+                                    <p className="admin-metric-sub">{card.sub}</p>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="admin-points-grid">
+                            <div className="glass-panel admin-points-panel">
+                                <div className="section-title-row" style={{ marginBottom: '1rem' }}>
+                                    <h3 className="section-title">최근 포인트 흐름</h3>
+                                    <span className="section-limit">{formatCount(filteredPointLedger.length)}건</span>
+                                </div>
+                                {adminPointLoading && !pointDashboard ? (
+                                    <p className="text-muted">포인트 흐름을 불러오는 중입니다...</p>
+                                ) : (
+                                    <div className="points-ledger">
+                                        {filteredPointLedger.slice(0, 30).map((tx) => (
+                                            <div key={tx.id} className="points-ledger-item">
+                                                <div>
+                                                    <div className="points-ledger-head">
+                                                        <strong>{tx.userName || '알 수 없음'}</strong>
+                                                        <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
+                                                            {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}
+                                                        </span>
+                                                    </div>
+                                                    <p className="text-muted points-ledger-note">
+                                                        {tx.transactionType} · {tx.note || '메모 없음'} · {tx.userEmail || '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="points-ledger-meta">
+                                                    <span>{formatDateTime(tx.createdAt)}</span>
+                                                    <span>잔액 {formatPointAmount(tx.balanceAfter)}</span>
+                                                </div>
+                                            </div>
+                                        ))}
+                                        {filteredPointLedger.length === 0 && <p className="text-muted">내역이 없습니다.</p>}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="glass-panel admin-points-panel">
+                                <div className="section-title-row" style={{ marginBottom: '1rem' }}>
+                                    <h3 className="section-title">잔액 상위 회원</h3>
+                                    <span className="section-limit">{pointTopUsers.length}명</span>
+                                </div>
+                                <div className="admin-card-list">
+                                    {pointTopUsers.map((row) => (
+                                        <div key={row.id} className="admin-feed-card">
+                                            <div className="admin-feed-head">
+                                                <div>
+                                                    <strong>{row.name}</strong>
+                                                    <p className="text-muted admin-feed-sub">{row.email || '-'} · #{row.id}</p>
+                                                </div>
+                                                <span className="badge badge-gold">{formatPointAmount(row.pointBalance)}</span>
+                                            </div>
+                                            <p className="admin-feed-text">가입일 {formatDate(row.createdAt)}</p>
+                                        </div>
+                                    ))}
+                                    {pointTopUsers.length === 0 && <p className="text-muted">표시할 회원이 없습니다.</p>}
+                                </div>
+                            </div>
                         </div>
                     </div>
                 )}
@@ -3100,7 +3914,11 @@ export default function App() {
                                         <span className="admin-story-meta-text">{adminStoryDetail.story.authorEmail || '-'}</span>
                                         <span className="admin-story-meta-dot">·</span>
                                         <span className={`admin-story-meta-status ${adminStoryDetail.story.isPublic ? 'is-public' : 'is-private'}`}>
-                                            {adminStoryDetail.story.isPublic ? '공개' : '비공개'}
+                                            {resolveStoryVisibilityInfo({
+                                                isPublic: adminStoryDetail.story.isPublic,
+                                                publicStatus: adminStoryDetail.story.publicStatus || null,
+                                                publicMethod: adminStoryDetail.story.publicMethod || null,
+                                            }).label}
                                         </span>
                                     </p>
                                 </div>
@@ -3108,8 +3926,16 @@ export default function App() {
                             </div>
 
                             <div className="admin-story-modal-badges">
-                                <span className={`badge ${adminStoryDetail.story.isPublic ? 'badge-green' : 'badge-red'}`}>
-                                    {adminStoryDetail.story.isPublic ? '공개' : '비공개'}
+                                <span className={`badge ${resolveStoryVisibilityInfo({
+                                    isPublic: adminStoryDetail.story.isPublic,
+                                    publicStatus: adminStoryDetail.story.publicStatus || null,
+                                    publicMethod: adminStoryDetail.story.publicMethod || null,
+                                }).badge}`}>
+                                    {resolveStoryVisibilityInfo({
+                                        isPublic: adminStoryDetail.story.isPublic,
+                                        publicStatus: adminStoryDetail.story.publicStatus || null,
+                                        publicMethod: adminStoryDetail.story.publicMethod || null,
+                                    }).label}
                                 </span>
                                 <span className="badge badge-green">인물 {adminStoryDetail.characters.length}명</span>
                                 <span className="badge badge-gold">메시지 {adminStoryDetail.messages.length}건</span>
@@ -3134,7 +3960,7 @@ export default function App() {
                                     </div>
                                     <div className="admin-story-block">
                                         <h4>뷰어 설정</h4>
-                                        <pre>{JSON.stringify(adminStoryDetail.story.viewer_settings || {}, null, 2)}</pre>
+                                        <pre>{JSON.stringify(adminStoryDetail.story.viewerSettings || {}, null, 2)}</pre>
                                     </div>
                                 </div>
 
@@ -3196,6 +4022,132 @@ export default function App() {
                         </div>
                     </div>
                 )}
+
+                {adminPointUserDetail && (
+                    <div className="modal-overlay" onClick={() => setAdminPointUserDetail(null)}>
+                        <div className="modal-content admin-point-modal" onClick={(e) => e.stopPropagation()}>
+                            <div className="admin-story-modal-header">
+                                <div>
+                                    <div className="admin-story-modal-title">
+                                        <Coins size={20} className="text-accent" />
+                                        <h2>{adminPointUserDetail.user.name}</h2>
+                                    </div>
+                                    <p className="text-muted admin-story-meta-line">
+                                        <span className="admin-story-meta-text">{adminPointUserDetail.user.email || '-'}</span>
+                                        <span className="admin-story-meta-dot">·</span>
+                                        <span className="admin-story-meta-text">{adminPointUserDetail.user.provider}</span>
+                                        <span className="admin-story-meta-dot">·</span>
+                                        <span className={`badge ${adminPointUserDetail.user.role === 'admin' ? 'badge-red' : 'badge-green'}`}>
+                                            {adminPointUserDetail.user.role}
+                                        </span>
+                                    </p>
+                                </div>
+                                <button className="btn btn-outline" onClick={() => setAdminPointUserDetail(null)}>닫기</button>
+                            </div>
+
+                            <div className="admin-story-modal-badges">
+                                <span className="badge badge-gold">잔액 {formatPointAmount(adminPointUserDetail.user.pointBalance)}</span>
+                                <span className="badge badge-green">{adminPointUserDetail.storyCount}개 이야기</span>
+                                <span className={`badge ${adminPointUserDetail.user.isSuspended ? 'badge-red' : 'badge-green'}`}>
+                                    {adminPointUserDetail.user.isSuspended ? '정지' : '정상'}
+                                </span>
+                            </div>
+
+                            <div className="admin-point-grid">
+                                <div className="admin-point-panel">
+                                    <h3>회원 정보</h3>
+                                    <div className="admin-story-detail-meta">
+                                        <div><span>가입일</span><strong>{formatDateTime(adminPointUserDetail.user.createdAt)}</strong></div>
+                                        <div><span>성인 인증</span><strong>{adminPointUserDetail.user.isAdult ? '완료' : '미완료'}</strong></div>
+                                        <div><span>프리미엄</span><strong>{adminPointUserDetail.user.isPremium ? '사용 중' : '일반'}</strong></div>
+                                        <div><span>공개 권한</span><strong>{adminPointUserDetail.user.canPublishCommunity ? '허용' : '비허용'}</strong></div>
+                                    </div>
+                                    <div className="admin-point-actions">
+                                        <button
+                                            className="btn btn-outline"
+                                            onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { isPremium: !adminPointUserDetail.user.isPremium })}
+                                            disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
+                                        >
+                                            {adminPointUserDetail.user.isPremium ? '프리미엄 끄기' : '프리미엄 켜기'}
+                                        </button>
+                                        <button
+                                            className="btn btn-outline"
+                                            onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { canPublishCommunity: !adminPointUserDetail.user.canPublishCommunity })}
+                                            disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
+                                        >
+                                            {adminPointUserDetail.user.canPublishCommunity ? '공개권한 회수' : '공개권한 부여'}
+                                        </button>
+                                        <button
+                                            className="btn btn-outline is-danger"
+                                            onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { isSuspended: !adminPointUserDetail.user.isSuspended })}
+                                            disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
+                                        >
+                                            {adminPointUserDetail.user.isSuspended ? '정지 해제' : '정지'}
+                                        </button>
+                                    </div>
+                                    {adminPointUserDetail.user.role === 'admin' && (
+                                        <p className="input-help" style={{ marginTop: '0.75rem' }}>
+                                            관리자 계정은 권한 변경과 포인트 조정이 제한됩니다.
+                                        </p>
+                                    )}
+                                </div>
+
+                                <div className="admin-point-panel">
+                                    <h3>포인트 조정</h3>
+                                    <div className="input-group">
+                                        <label>변경 포인트 (+ / -)</label>
+                                        <input
+                                            className="input-control"
+                                            value={adminPointAdjustment}
+                                            onChange={(e) => setAdminPointAdjustment(e.target.value)}
+                                            placeholder="예: 100 또는 -50"
+                                            disabled={adminPointUserDetail.user.role === 'admin'}
+                                        />
+                                    </div>
+                                    <div className="input-group">
+                                        <label>사유</label>
+                                        <textarea
+                                            className="input-control"
+                                            value={adminPointAdjustmentNote}
+                                            onChange={(e) => setAdminPointAdjustmentNote(e.target.value)}
+                                            placeholder="포인트 지급/회수/수정 사유를 남겨주세요."
+                                            disabled={adminPointUserDetail.user.role === 'admin'}
+                                        />
+                                    </div>
+                                    <button
+                                        className="btn btn-primary"
+                                        style={{ width: '100%', justifyContent: 'center' }}
+                                        onClick={() => void handleAdminPointAdjustment()}
+                                        disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `point:${adminPointUserDetail.user.id}`}
+                                    >
+                                        <CircleDollarSign size={16} /> 저장하기
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div className="admin-point-panel" style={{ marginTop: '1rem' }}>
+                                <h3>최근 포인트 내역</h3>
+                                <div className="admin-detail-list admin-detail-scroll">
+                                    {adminPointUserDetail.recentTransactions.map((tx) => (
+                                        <div key={tx.id} className="admin-detail-item">
+                                            <div className="admin-detail-item-head">
+                                                <strong>{tx.transactionType}</strong>
+                                                <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
+                                                    {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}
+                                                </span>
+                                            </div>
+                                            <p className="text-muted admin-detail-mini">
+                                                {formatDateTime(tx.createdAt)} · 잔액 {formatPointAmount(tx.balanceAfter)}
+                                            </p>
+                                            <p className="admin-detail-text">{tx.note || '메모 없음'}</p>
+                                        </div>
+                                    ))}
+                                    {adminPointUserDetail.recentTransactions.length === 0 && <p className="text-muted">최근 내역이 없습니다.</p>}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
             </div>
         );
     };
@@ -3208,6 +4160,7 @@ export default function App() {
             {view === 'community' && renderCommunity()}
             {view === 'studio' && renderStudio()}
             {view === 'chat' && renderChat()}
+            {view === 'points' && renderPoints()}
             {view === 'admin' && renderAdmin()}
         </div>
     );

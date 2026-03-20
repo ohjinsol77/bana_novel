@@ -6,6 +6,7 @@ import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import pkg from 'passport-naver-v2';
 const { Strategy: NaverStrategy } = pkg;
 import pool from '../db.js';
+import { adjustUserPointBalance, getChatPointCostForUser, getStoryLimitForUser, WELCOME_POINT_BONUS } from '../db.js';
 import { resolveSessionUser } from '../session.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
@@ -20,19 +21,75 @@ const FRONTEND = process.env.FRONTEND_URL || 'http://localhost:5173';
 
 // ── Upsert user & issue JWT ──────────────────────────────────
 async function upsertUser({ oauth_id, provider, name, email, profile_img }) {
-    const [rows] = await pool.query(
-        `INSERT INTO users (oauth_id, provider, name, email, profile_img)
-         VALUES (?, ?, ?, ?, ?)
-         ON DUPLICATE KEY UPDATE name=VALUES(name), email=VALUES(email), profile_img=VALUES(profile_img)`,
-        [oauth_id, provider, name, email, profile_img]
-    );
-    const [users] = await pool.query('SELECT * FROM users WHERE oauth_id=? AND provider=?', [oauth_id, provider]);
-    return users[0];
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [existingRows] = await conn.query(
+            'SELECT * FROM users WHERE oauth_id=? AND provider=? LIMIT 1 FOR UPDATE',
+            [oauth_id, provider]
+        );
+        const isNew = !existingRows.length;
+
+        if (isNew) {
+            await conn.query(
+                `INSERT INTO users (oauth_id, provider, name, email, profile_img, point_balance)
+                 VALUES (?, ?, ?, ?, ?, 0)`,
+                [oauth_id, provider, name, email, profile_img]
+            );
+        } else {
+            await conn.query(
+                `UPDATE users
+                 SET name=?, email=?, profile_img=?
+                 WHERE oauth_id=? AND provider=?`,
+                [name, email, profile_img, oauth_id, provider]
+            );
+        }
+
+        const [users] = await conn.query(
+            `SELECT *
+             FROM users
+             WHERE oauth_id=? AND provider=?
+             LIMIT 1
+             FOR UPDATE`,
+            [oauth_id, provider]
+        );
+        const user = users[0];
+
+        if (isNew) {
+            const result = await adjustUserPointBalance(conn, {
+                userId: user.id,
+                amount: WELCOME_POINT_BONUS,
+                transactionType: 'welcome',
+                note: '회원가입 웰컴 포인트',
+                referenceType: 'auth',
+                referenceId: user.id,
+            });
+            user.point_balance = result.afterBalance;
+        }
+
+        await conn.commit();
+        return user;
+    } catch (err) {
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
+    }
 }
 
 function makeToken(user) {
     return jwt.sign(
-        { id: user.id, name: user.name, email: user.email, role: user.role, is_adult: user.is_adult, is_premium: user.is_premium },
+        {
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            role: user.role,
+            is_adult: user.is_adult,
+            is_premium: user.is_premium,
+            can_publish_community: Boolean(user.can_publish_community),
+            point_balance: Number(user.point_balance || 0),
+        },
         process.env.JWT_SECRET,
         { expiresIn: '7d' }
     );
@@ -117,7 +174,12 @@ router.get('/naver/callback',
 router.get('/me', async (req, res) => {
     try {
         const user = await resolveSessionUser(req, { allowGuestAdmin: true });
-        res.json(user);
+        res.json({
+            ...user,
+            point_balance: Number(user.point_balance || 0),
+            story_limit: getStoryLimitForUser(user),
+            chat_point_cost: getChatPointCostForUser(user),
+        });
     } catch (err) {
         res.status(err.status || 401).json({ error: err.message || '토큰 만료 또는 유효하지 않음' });
     }
@@ -130,7 +192,7 @@ router.get('/users', async (req, res) => {
         if (me.role !== 'admin') return res.status(403).json({ error: '관리자 권한 필요' });
 
         try {
-            const [rows] = await pool.query('SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, created_at AS createdAt FROM users ORDER BY id DESC');
+            const [rows] = await pool.query('SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, point_balance AS pointBalance, created_at AS createdAt FROM users ORDER BY id DESC');
             res.json(rows);
         } catch (dbErr) {
             console.error('Error fetching users:', dbErr);

@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS users (
     is_adult    TINYINT(1) DEFAULT 0,
     is_premium  TINYINT(1) DEFAULT 0,
     is_suspended TINYINT(1) DEFAULT 0,
+    can_publish_community TINYINT(1) DEFAULT 0,
+    point_balance INT NOT NULL DEFAULT 0,
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_oauth (oauth_id, provider)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -30,6 +32,7 @@ CREATE TABLE IF NOT EXISTS stories (
     cover_image_url LONGTEXT,
     is_public       TINYINT(1) DEFAULT 0,
     public_status   ENUM('private','pending','approved','rejected') DEFAULT 'private',
+    public_method   ENUM('private','request','approved','direct') DEFAULT 'private',
     public_requested_at DATETIME NULL,
     public_reviewed_at DATETIME NULL,
     public_reviewed_by INT NULL,
@@ -62,6 +65,23 @@ CREATE TABLE IF NOT EXISTS story_messages (
     content        TEXT NOT NULL,
     created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (story_id) REFERENCES stories(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS point_transactions (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    user_id         INT NOT NULL,
+    amount          INT NOT NULL,
+    balance_after   INT NOT NULL,
+    transaction_type ENUM('welcome','topup','chat','admin_grant','admin_deduct','refund','adjustment') NOT NULL,
+    note            VARCHAR(255) NULL,
+    reference_type  VARCHAR(50) NULL,
+    reference_id    INT NULL,
+    created_by      INT NULL,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_point_transactions_user_created (user_id, created_at),
+    INDEX idx_point_transactions_type_created (transaction_type, created_at),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 관리자 계정 시드

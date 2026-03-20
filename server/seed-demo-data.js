@@ -1,4 +1,4 @@
-import pool from './db.js';
+import pool, { adjustUserPointBalance, WELCOME_POINT_BONUS } from './db.js';
 import { serializeCharacterPayload } from './persona.js';
 
 function formatDateTime(date) {
@@ -42,9 +42,9 @@ async function upsertUser(conn, user) {
         `
         INSERT INTO users (
             oauth_id, provider, name, email, profile_img, role,
-            is_adult, is_premium, is_suspended, created_at
+            is_adult, is_premium, is_suspended, can_publish_community, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON DUPLICATE KEY UPDATE
             name=VALUES(name),
             email=VALUES(email),
@@ -52,7 +52,8 @@ async function upsertUser(conn, user) {
             role=VALUES(role),
             is_adult=VALUES(is_adult),
             is_premium=VALUES(is_premium),
-            is_suspended=VALUES(is_suspended)
+            is_suspended=VALUES(is_suspended),
+            can_publish_community=VALUES(can_publish_community)
         `,
         [
             user.oauth_id,
@@ -64,6 +65,7 @@ async function upsertUser(conn, user) {
             user.is_adult ? 1 : 0,
             user.is_premium ? 1 : 0,
             user.is_suspended ? 1 : 0,
+            user.can_publish_community ? 1 : 0,
             user.created_at,
         ]
     );
@@ -80,7 +82,29 @@ async function upsertUser(conn, user) {
     return rows[0].id;
 }
 
+async function applySeedPointTransactions(conn, userId, transactions = []) {
+    for (const transaction of transactions) {
+        const result = await adjustUserPointBalance(conn, {
+            userId,
+            amount: transaction.amount,
+            transactionType: transaction.transactionType,
+            note: transaction.note,
+            referenceType: transaction.referenceType || null,
+            referenceId: transaction.referenceId || null,
+            createdBy: transaction.createdBy || null,
+        });
+        if (transaction.created_at) {
+            await conn.query(
+                'UPDATE point_transactions SET created_at=? WHERE id=?',
+                [transaction.created_at, result.transactionId]
+            );
+        }
+    }
+}
+
 async function upsertStory(conn, userId, story) {
+    const publicStatus = story.public_status || (story.is_public ? 'approved' : 'private');
+    const publicMethod = story.public_method || (story.is_public ? 'approved' : 'private');
     const [existing] = await conn.query(
         'SELECT id FROM stories WHERE user_id=? AND title=? LIMIT 1',
         [userId, story.title]
@@ -92,7 +116,7 @@ async function upsertStory(conn, userId, story) {
         await conn.query(
             `
             UPDATE stories
-            SET background=?, environment=?, viewer_settings=?, is_public=?, updated_at=?
+            SET background=?, environment=?, viewer_settings=?, is_public=?, public_status=?, public_method=?, updated_at=?
             WHERE id=?
             `,
             [
@@ -100,6 +124,8 @@ async function upsertStory(conn, userId, story) {
                 story.environment,
                 JSON.stringify(story.viewer_settings),
                 story.is_public ? 1 : 0,
+                publicStatus,
+                publicMethod,
                 story.updated_at,
                 storyId,
             ]
@@ -111,9 +137,9 @@ async function upsertStory(conn, userId, story) {
             `
             INSERT INTO stories (
                 user_id, title, background, environment, viewer_settings,
-                is_public, created_at, updated_at
+                is_public, public_status, public_method, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `,
             [
                 userId,
@@ -122,6 +148,8 @@ async function upsertStory(conn, userId, story) {
                 story.environment,
                 JSON.stringify(story.viewer_settings),
                 story.is_public ? 1 : 0,
+                publicStatus,
+                publicMethod,
                 story.created_at,
                 story.updated_at,
             ]
@@ -173,6 +201,7 @@ async function main() {
                 is_adult: 0,
                 is_premium: 0,
                 is_suspended: 0,
+                can_publish_community: 0,
                 created_at: minutesAgo(now, 24 * 60 * 3 + 120),
             },
             {
@@ -184,6 +213,7 @@ async function main() {
                 is_adult: 1,
                 is_premium: 1,
                 is_suspended: 0,
+                can_publish_community: 1,
                 created_at: minutesAgo(now, 24 * 60 * 2 + 45),
             },
             {
@@ -195,6 +225,7 @@ async function main() {
                 is_adult: 0,
                 is_premium: 0,
                 is_suspended: 0,
+                can_publish_community: 0,
                 created_at: minutesAgo(now, 24 * 60 + 30),
             },
         ];
@@ -202,6 +233,94 @@ async function main() {
         const userIds = [];
         for (const user of users) {
             userIds.push(await upsertUser(conn, user));
+        }
+
+        if (userIds.length) {
+            await conn.query('DELETE FROM point_transactions WHERE user_id IN (?)', [userIds]);
+            await conn.query('UPDATE users SET point_balance=0 WHERE id IN (?)', [userIds]);
+        }
+
+        const pointPlans = [
+            [
+                {
+                    amount: WELCOME_POINT_BONUS,
+                    transactionType: 'welcome',
+                    note: '회원가입 웰컴 포인트',
+                    referenceType: 'auth',
+                    created_at: users[0].created_at,
+                },
+                {
+                    amount: 100,
+                    transactionType: 'topup',
+                    note: '포인트 충전 100P',
+                    referenceType: 'topup',
+                    created_at: minutesAgo(now, 24 * 60 * 2 + 180),
+                },
+                {
+                    amount: -45,
+                    transactionType: 'chat',
+                    note: '최근 집필 3회 차감',
+                    referenceType: 'story',
+                    created_at: minutesAgo(now, 240),
+                },
+            ],
+            [
+                {
+                    amount: WELCOME_POINT_BONUS,
+                    transactionType: 'welcome',
+                    note: '회원가입 웰컴 포인트',
+                    referenceType: 'auth',
+                    created_at: users[1].created_at,
+                },
+                {
+                    amount: 300,
+                    transactionType: 'topup',
+                    note: '프리미엄 사용자 충전 300P',
+                    referenceType: 'topup',
+                    created_at: minutesAgo(now, 24 * 60 + 360),
+                },
+                {
+                    amount: -70,
+                    transactionType: 'chat',
+                    note: '프리미엄 대화 차감',
+                    referenceType: 'story',
+                    created_at: minutesAgo(now, 180),
+                },
+                {
+                    amount: 40,
+                    transactionType: 'admin_grant',
+                    note: '이벤트 포인트 지급',
+                    referenceType: 'admin',
+                    created_at: minutesAgo(now, 90),
+                },
+            ],
+            [
+                {
+                    amount: WELCOME_POINT_BONUS,
+                    transactionType: 'welcome',
+                    note: '회원가입 웰컴 포인트',
+                    referenceType: 'auth',
+                    created_at: users[2].created_at,
+                },
+                {
+                    amount: -15,
+                    transactionType: 'chat',
+                    note: '첫 집필 사용',
+                    referenceType: 'story',
+                    created_at: minutesAgo(now, 75),
+                },
+                {
+                    amount: 50,
+                    transactionType: 'topup',
+                    note: '포인트 충전 50P',
+                    referenceType: 'topup',
+                    created_at: minutesAgo(now, 40),
+                },
+            ],
+        ];
+
+        for (const [index, transactions] of pointPlans.entries()) {
+            await applySeedPointTransactions(conn, userIds[index], transactions);
         }
 
         const stories = [

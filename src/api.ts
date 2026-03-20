@@ -16,6 +16,32 @@ export async function fetchMe() {
     return res.json();
 }
 
+export async function fetchMyPoints() {
+    const res = await fetch(`${BASE}/points/me`, { headers: authHeaders() });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `포인트 정보를 가져올 수 없습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function topUpPoints(data: { amount: number; packageName?: string }) {
+    const res = await fetch(`${BASE}/points/topup`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `포인트 충전에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
 // ── Stories ─────────────────────────────────────────────────
 export async function fetchStories() {
     const res = await fetch(`${BASE}/stories`, { headers: authHeaders() });
@@ -103,7 +129,9 @@ export async function sendStoryMessage(storyId: number, content: string) {
     });
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        throw new Error(errData.error || `집필 전송 실패 (${res.status})`);
+        const error = new Error(errData.error || `집필 전송 실패 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
     }
     return res.json();
 }
@@ -194,6 +222,39 @@ export async function updateAdminUser(id: number, data: Record<string, unknown>)
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || `회원 상태를 변경할 수 없습니다 (${res.status})`);
+    }
+    return res.json();
+}
+
+export async function fetchAdminPointDashboard() {
+    const res = await fetch(`${BASE}/admin/points/dashboard`, { headers: authHeaders() });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `포인트 대시보드를 불러올 수 없습니다 (${res.status})`);
+    }
+    return res.json();
+}
+
+export async function fetchAdminPointUser(id: number) {
+    const res = await fetch(`${BASE}/admin/users/${id}/detail`, { headers: authHeaders() });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `회원 포인트 정보를 불러올 수 없습니다 (${res.status})`);
+    }
+    return res.json();
+}
+
+export async function adjustAdminUserPoints(id: number, data: { amount: number; note: string }) {
+    const res = await fetch(`${BASE}/admin/users/${id}/points`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `포인트를 조정할 수 없습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
     }
     return res.json();
 }

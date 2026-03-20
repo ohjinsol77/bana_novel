@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import pool from './db.js';
+import { getChatPointCostForUser, getStoryLimitForUser } from './db.js';
 
 function createSessionError(message, status = 401, code = 'SESSION_ERROR') {
     const error = new Error(message);
@@ -12,7 +13,22 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
     const token = req.headers.authorization?.split(' ')[1];
     if (!token || token === 'null' || token === 'undefined') {
         if (allowGuestAdmin) {
-            return { id: 1, name: '손님', email: '', role: 'admin', is_adult: false, is_premium: false, is_suspended: false };
+            const guestAdmin = {
+                id: 1,
+                name: '손님',
+                email: '',
+                role: 'admin',
+                is_adult: false,
+                is_premium: false,
+                is_suspended: false,
+                can_publish_community: false,
+                point_balance: 0,
+            };
+            return {
+                ...guestAdmin,
+                story_limit: getStoryLimitForUser(guestAdmin),
+                chat_point_cost: getChatPointCostForUser(guestAdmin),
+            };
         }
         throw createSessionError('인증이 필요합니다.', 401, 'NO_TOKEN');
     }
@@ -25,7 +41,7 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
     }
 
     const [rows] = await pool.query(
-        'SELECT id, name, email, role, is_adult, is_premium, is_suspended FROM users WHERE id=? LIMIT 1',
+        'SELECT id, name, email, role, is_adult, is_premium, is_suspended, can_publish_community, point_balance FROM users WHERE id=? LIMIT 1',
         [payload.id]
     );
 
@@ -38,7 +54,7 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
         throw createSessionError('정지된 계정입니다.', 403, 'SUSPENDED');
     }
 
-    return {
+    const sessionUser = {
         id: user.id,
         name: user.name,
         email: user.email,
@@ -46,6 +62,14 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
         is_adult: Boolean(user.is_adult),
         is_premium: Boolean(user.is_premium),
         is_suspended: Boolean(user.is_suspended),
+        can_publish_community: Boolean(user.can_publish_community),
+        point_balance: Number(user.point_balance) || 0,
+    };
+
+    return {
+        ...sessionUser,
+        story_limit: getStoryLimitForUser(sessionUser),
+        chat_point_cost: getChatPointCostForUser(sessionUser),
     };
 }
 

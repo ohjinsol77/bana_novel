@@ -1,5 +1,6 @@
 import express from 'express';
 import pool from '../db.js';
+import { getStoryLimitForUser } from '../db.js';
 import { hydrateCharacterRow, serializeCharacterPayload } from '../persona.js';
 import { resolveSessionUser } from '../session.js';
 
@@ -19,12 +20,76 @@ function normalizePublicStatus(value) {
     return ['private', 'pending', 'approved', 'rejected'].includes(value) ? value : 'private';
 }
 
-function resolvePublicStoryState(currentStory, requestedPublic) {
+function normalizePublicMethod(value) {
+    return ['private', 'request', 'approved', 'direct'].includes(value) ? value : null;
+}
+
+function canDirectPublish(user) {
+    return user?.role === 'admin' || Boolean(user?.can_publish_community);
+}
+
+function resolvePublicStoryState(currentStory, requestedMethod, requestedPublic, user) {
     const status = normalizePublicStatus(currentStory?.public_status);
-    if (!requestedPublic) {
+    const currentMethod = normalizePublicMethod(currentStory?.public_method);
+    let method = normalizePublicMethod(requestedMethod);
+
+    if (!method) {
+        if (requestedPublic) {
+            method = canDirectPublish(user) ? 'direct' : 'request';
+        } else if (currentMethod) {
+            method = currentMethod;
+        } else if (status === 'approved' && currentStory?.is_public) {
+            method = 'approved';
+        } else if (status === 'pending') {
+            method = 'request';
+        } else {
+            method = 'private';
+        }
+    }
+
+    if (method === 'approved' && status !== 'approved') {
+        method = requestedPublic ? (canDirectPublish(user) ? 'direct' : 'request') : 'private';
+    }
+
+    if (method === 'direct' && !canDirectPublish(user)) {
+        const error = new Error('직접 공개 권한이 없습니다.');
+        error.status = 403;
+        throw error;
+    }
+
+    if (method === 'private') {
         return {
             is_public: 0,
             public_status: 'private',
+            public_method: 'private',
+            public_requested_at: null,
+            public_reviewed_at: null,
+            public_reviewed_by: null,
+            public_review_message: null,
+        };
+    }
+
+    if (method === 'request') {
+        const requestedAt = status === 'pending'
+            ? (currentStory?.public_requested_at || new Date())
+            : new Date();
+
+        return {
+            is_public: 0,
+            public_status: 'pending',
+            public_method: 'request',
+            public_requested_at: requestedAt,
+            public_reviewed_at: null,
+            public_reviewed_by: null,
+            public_review_message: null,
+        };
+    }
+
+    if (method === 'direct') {
+        return {
+            is_public: 1,
+            public_status: 'approved',
+            public_method: 'direct',
             public_requested_at: null,
             public_reviewed_at: null,
             public_reviewed_by: null,
@@ -36,6 +101,7 @@ function resolvePublicStoryState(currentStory, requestedPublic) {
         return {
             is_public: 1,
             public_status: 'approved',
+            public_method: 'approved',
             public_requested_at: currentStory?.public_requested_at || null,
             public_reviewed_at: currentStory?.public_reviewed_at || null,
             public_reviewed_by: currentStory?.public_reviewed_by || null,
@@ -43,14 +109,11 @@ function resolvePublicStoryState(currentStory, requestedPublic) {
         };
     }
 
-    const requestedAt = status === 'pending'
-        ? (currentStory?.public_requested_at || new Date())
-        : new Date();
-
     return {
         is_public: 0,
-        public_status: 'pending',
-        public_requested_at: requestedAt,
+        public_status: 'private',
+        public_method: 'private',
+        public_requested_at: null,
         public_reviewed_at: null,
         public_reviewed_by: null,
         public_review_message: null,
@@ -135,18 +198,31 @@ router.post('/', auth, async (req, res) => {
     try {
         await conn.beginTransaction();
 
-        const { title, background, environment, is_public, characters } = req.body;
+        const { title, background, environment, is_public, public_method, characters } = req.body;
 
         if (!title) throw new Error('이야기 제목은 필수입니다.');
         if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
-        const publicState = resolvePublicStoryState(null, Boolean(is_public));
+
+        const [countRows] = await conn.query('SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?', [req.user.id]);
+        const storyCount = Number(countRows[0]?.storyCount || 0);
+        const storyLimit = getStoryLimitForUser(req.user);
+        if (storyCount >= storyLimit) {
+            const error = new Error(`이야기는 최대 ${storyLimit}개까지 보유할 수 있습니다.`);
+            error.status = 403;
+            error.code = 'STORY_LIMIT_REACHED';
+            error.storyCount = storyCount;
+            error.storyLimit = storyLimit;
+            throw error;
+        }
+
+        const publicState = resolvePublicStoryState(null, public_method, Boolean(is_public), req.user);
 
         // 1. 이야기(방) 생성
         const [storyResult] = await conn.query(
             `INSERT INTO stories (
-                user_id, title, background, environment, is_public, public_status,
+                user_id, title, background, environment, is_public, public_status, public_method,
                 public_requested_at, public_reviewed_at, public_reviewed_by, public_review_message, cover_image_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [
                 req.user.id,
                 title,
@@ -154,6 +230,7 @@ router.post('/', auth, async (req, res) => {
                 environment,
                 publicState.is_public,
                 publicState.public_status,
+                publicState.public_method,
                 publicState.public_requested_at,
                 publicState.public_reviewed_at,
                 publicState.public_reviewed_by,
@@ -189,7 +266,12 @@ router.post('/', auth, async (req, res) => {
     } catch (err) {
         await conn.rollback();
         console.error('Error creating story:', err);
-        res.status(500).json({ error: '이야기 생성 실패: ' + err.message });
+        res.status(err.status || 500).json({
+            error: (err.status ? err.message : '이야기 생성 실패: ' + err.message),
+            code: err.code || null,
+            storyCount: Number(err.storyCount || 0),
+            storyLimit: Number(err.storyLimit || 0),
+        });
     } finally {
         conn.release();
     }
@@ -205,21 +287,21 @@ router.put('/:id', auth, async (req, res) => {
     try {
         await conn.beginTransaction();
         const storyId = req.params.id;
-        const { title, background, environment, is_public, cover_image_url, characters } = req.body;
+        const { title, background, environment, is_public, public_method, cover_image_url, characters } = req.body;
 
         // 본인 소유 확인
-        const [check] = await conn.query('SELECT id, public_status, cover_image_url FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
+        const [check] = await conn.query('SELECT id, public_status, public_method, public_requested_at, public_reviewed_at, public_reviewed_by, public_review_message, cover_image_url FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
         if (!check.length) throw new Error('권한이 없거나 이야기를 찾을 수 없습니다.');
         if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
         const currentStory = check[0];
-        const publicState = resolvePublicStoryState(currentStory, Boolean(is_public));
+        const publicState = resolvePublicStoryState(currentStory, public_method, Boolean(is_public), req.user);
         const nextCoverImageUrl = normalizePublicStatus(currentStory.public_status) === 'approved' && typeof cover_image_url === 'string'
             ? cover_image_url
             : currentStory.cover_image_url || null;
 
         // 1. 이야기 메인 정보 업데이트
         await conn.query(
-            `UPDATE stories SET title=?, background=?, environment=?, is_public=?, public_status=?, public_requested_at=?, public_reviewed_at=?, public_reviewed_by=?, public_review_message=?, cover_image_url=?
+            `UPDATE stories SET title=?, background=?, environment=?, is_public=?, public_status=?, public_method=?, public_requested_at=?, public_reviewed_at=?, public_reviewed_by=?, public_review_message=?, cover_image_url=?
              WHERE id=? AND user_id=?`,
             [
                 title,
@@ -227,6 +309,7 @@ router.put('/:id', auth, async (req, res) => {
                 environment,
                 publicState.is_public,
                 publicState.public_status,
+                publicState.public_method,
                 publicState.public_requested_at,
                 publicState.public_reviewed_at,
                 publicState.public_reviewed_by,
@@ -265,7 +348,7 @@ router.put('/:id', auth, async (req, res) => {
     } catch (err) {
         await conn.rollback();
         console.error('Error updating story:', err);
-        res.status(500).json({ error: '수정 실패: ' + err.message });
+        res.status(err.status || 500).json({ error: (err.status ? err.message : '수정 실패: ' + err.message) });
     } finally {
         conn.release();
     }
@@ -281,6 +364,7 @@ router.get('/community', auth, async (req, res) => {
                 s.environment,
                 s.cover_image_url AS coverImageUrl,
                 s.public_status AS publicStatus,
+                s.public_method AS publicMethod,
                 s.is_public AS isPublic,
                 s.updated_at AS updatedAt,
                 s.created_at AS createdAt,
@@ -324,12 +408,13 @@ router.get('/public/feed', async (_req, res) => {
                 s.background,
                 s.environment,
                 s.cover_image_url AS coverImageUrl,
+                s.public_method AS publicMethod,
                 s.updated_at AS updatedAt,
                 u.name AS authorName
             FROM stories s
             LEFT JOIN users u ON u.id = s.user_id
             WHERE s.is_public=1
-              AND s.public_status='approved'
+              AND s.public_method IN ('approved', 'direct')
             ORDER BY s.updated_at DESC, s.id DESC
             LIMIT 50
         `);

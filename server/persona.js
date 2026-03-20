@@ -153,6 +153,7 @@ function fallbackLegacyBackground(row) {
 export function createEmptyPersona() {
     return {
         name: '',
+        isProtagonist: false,
         age: null,
         gender: 'other',
         job: '',
@@ -180,6 +181,7 @@ export function normalizeCharacterPayload(character = {}) {
 
     return {
         name: toLimitedString(source.name, 100),
+        isProtagonist: Boolean(source.isProtagonist),
         age: parseAge(source.age),
         gender: OPTION_LOOKUPS.gender.has(source.gender) ? source.gender : 'other',
         job: toLimitedString(source.job, 100),
@@ -244,6 +246,7 @@ export function formatCharacterPersona(character) {
     return [
         `[인물: ${character.name || '이름 미설정'}]`,
         `- 기본 정보: 나이 ${ageText}, 성별 ${OPTION_LOOKUPS.gender.get(character.gender) || '기타'}, 직업 ${character.job || '미설정'}, 거주지 ${character.residence || '미설정'}`,
+        `- 주인공 여부: ${character.isProtagonist ? '주인공' : '조연/기타'}`,
         `- 성격: ${toDisplayText(character.personality, 'personality')}`,
         `- 말투: ${toDisplayText(character.speechStyles, 'speechStyles')}`,
         `- 행동 성향: ${toDisplayText(character.behaviorRules, 'behaviorRules')}`,
