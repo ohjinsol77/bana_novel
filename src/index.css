@@ -122,6 +122,21 @@ body {
   gap: 0.75rem;
 }
 
+.nav-point-pill {
+  padding: 0.45rem 0.85rem;
+  border-radius: 999px;
+  border: 1px solid rgba(124, 92, 252, 0.3);
+  background: linear-gradient(180deg, rgba(124, 92, 252, 0.16), rgba(124, 92, 252, 0.08));
+  color: var(--text-main);
+  font-size: 0.82rem;
+  font-weight: 600;
+}
+
+.nav-point-pill:hover {
+  border-color: rgba(124, 92, 252, 0.55);
+  background: linear-gradient(180deg, rgba(124, 92, 252, 0.24), rgba(124, 92, 252, 0.12));
+}
+
 /* ── Buttons ───────────────────────────────────────────── */
 .btn {
   display: inline-flex;
@@ -2177,6 +2192,7 @@ textarea.input-control {
 
   .home-hero,
   .home-limit-banner,
+  .landing-hero,
   .points-ledger-item,
   .admin-point-list-item {
     flex-direction: column;
@@ -2185,6 +2201,10 @@ textarea.input-control {
 
   .home-stats-grid,
   .points-summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .landing-hero {
     grid-template-columns: 1fr;
   }
 
@@ -2591,6 +2611,59 @@ textarea.input-control {
   font-weight: 800;
   color: var(--text-main);
   line-height: 1;
+}
+
+.landing-shell {
+  display: flex;
+  justify-content: center;
+}
+
+.landing-hero {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1.15fr 0.85fr;
+  gap: 1rem;
+  align-items: stretch;
+  background:
+    radial-gradient(circle at top left, rgba(124, 92, 252, 0.18), transparent 30%),
+    linear-gradient(180deg, rgba(19, 21, 28, 0.98), rgba(19, 21, 28, 0.92));
+}
+
+.landing-hero-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  justify-content: center;
+}
+
+.landing-title {
+  font-size: clamp(2rem, 4vw, 3.2rem);
+  line-height: 1.15;
+}
+
+.landing-subtitle {
+  max-width: 52ch;
+  line-height: 1.75;
+}
+
+.landing-actions {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.landing-feature-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.85rem;
+  align-content: center;
+}
+
+.landing-feature-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  min-height: 122px;
 }
 
 .points-layout {

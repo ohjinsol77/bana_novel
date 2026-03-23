@@ -260,6 +260,7 @@ export async function adjustAdminUserPoints(id: number, data: { amount: number; 
 }
 
 export const oauthUrl = {
+    apple: `${BASE}/auth/apple`,
     kakao: `${BASE}/auth/kakao`,
     google: `${BASE}/auth/google`,
     naver: `${BASE}/auth/naver`,

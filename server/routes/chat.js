@@ -46,7 +46,7 @@ async function writeChatDebugLog(details) {
 }
 
 function auth(req, res, next) {
-    resolveSessionUser(req, { allowGuestAdmin: true })
+    resolveSessionUser(req)
         .then((user) => {
             req.user = user;
             next();

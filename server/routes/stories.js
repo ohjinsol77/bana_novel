@@ -121,7 +121,7 @@ function resolvePublicStoryState(currentStory, requestedMethod, requestedPublic,
 }
 
 function auth(req, res, next) {
-    resolveSessionUser(req, { allowGuestAdmin: true })
+    resolveSessionUser(req)
         .then((user) => {
             req.user = user;
             next();

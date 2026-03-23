@@ -2,6 +2,8 @@ import jwt from 'jsonwebtoken';
 import pool from './db.js';
 import { getChatPointCostForUser, getStoryLimitForUser } from './db.js';
 
+const APPLE_ADMIN_LOCAL_TOKEN = 'apple-admin-local';
+
 function createSessionError(message, status = 401, code = 'SESSION_ERROR') {
     const error = new Error(message);
     error.status = status;
@@ -11,6 +13,25 @@ function createSessionError(message, status = 401, code = 'SESSION_ERROR') {
 
 export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) {
     const token = req.headers.authorization?.split(' ')[1];
+    if (token === APPLE_ADMIN_LOCAL_TOKEN) {
+        const appleAdmin = {
+            id: 1,
+            name: '애플 관리자',
+            email: 'admin@novelai.com',
+            role: 'admin',
+            is_adult: true,
+            is_premium: true,
+            is_suspended: false,
+            can_publish_community: true,
+            point_balance: 0,
+        };
+        return {
+            ...appleAdmin,
+            story_limit: getStoryLimitForUser(appleAdmin),
+            chat_point_cost: getChatPointCostForUser(appleAdmin),
+        };
+    }
+
     if (!token || token === 'null' || token === 'undefined') {
         if (allowGuestAdmin) {
             const guestAdmin = {

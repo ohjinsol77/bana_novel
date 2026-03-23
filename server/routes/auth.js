@@ -17,7 +17,7 @@ const __dirname = dirname(__filename);
 dotenv.config({ path: join(__dirname, '../.env') });
 
 const router = express.Router();
-const FRONTEND = process.env.FRONTEND_URL || 'http://localhost:5173';
+const FRONTEND = process.env.FRONTEND_URL || 'http://localhost:5174';
 
 // ── Upsert user & issue JWT ──────────────────────────────────
 async function upsertUser({ oauth_id, provider, name, email, profile_img }) {
@@ -66,6 +66,45 @@ async function upsertUser({ oauth_id, provider, name, email, profile_img }) {
                 referenceId: user.id,
             });
             user.point_balance = result.afterBalance;
+        }
+
+        await conn.commit();
+        return user;
+    } catch (err) {
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
+    }
+}
+
+async function getOrCreateAppleAdminUser() {
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [existingRows] = await conn.query(
+            'SELECT * FROM users WHERE oauth_id=? AND provider=? LIMIT 1 FOR UPDATE',
+            ['admin_seed', 'local']
+        );
+
+        if (!existingRows.length) {
+            await conn.query(
+                `INSERT INTO users (oauth_id, provider, name, email, role, point_balance)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                ['admin_seed', 'local', '관리자', 'admin@novelai.com', 'admin', 0]
+            );
+        }
+
+        const [rows] = await conn.query(
+            'SELECT * FROM users WHERE oauth_id=? AND provider=? LIMIT 1 FOR UPDATE',
+            ['admin_seed', 'local']
+        );
+        const user = rows[0];
+
+        if (String(user.role) !== 'admin') {
+            await conn.query('UPDATE users SET role=? WHERE id=?', ['admin', user.id]);
+            user.role = 'admin';
         }
 
         await conn.commit();
@@ -152,6 +191,17 @@ const oauthCallback = (provider) => (req, res) => {
     res.redirect(`${FRONTEND}/?token=${token}`);
 };
 
+router.get('/apple', async (_req, res) => {
+    try {
+        const user = await getOrCreateAppleAdminUser();
+        const token = makeToken(user);
+        res.redirect(`${FRONTEND}/?token=${token}`);
+    } catch (err) {
+        console.error('Apple admin login failed:', err);
+        res.status(500).send('애플 관리자 로그인에 실패했습니다.');
+    }
+});
+
 // Kakao
 router.get('/kakao', passport.authenticate('kakao'));
 router.get('/kakao/callback',
@@ -173,7 +223,7 @@ router.get('/naver/callback',
 // Token verify (프론트엔드가 토큰으로 본인 정보 확인)
 router.get('/me', async (req, res) => {
     try {
-        const user = await resolveSessionUser(req, { allowGuestAdmin: true });
+        const user = await resolveSessionUser(req);
         res.json({
             ...user,
             point_balance: Number(user.point_balance || 0),
@@ -188,7 +238,7 @@ router.get('/me', async (req, res) => {
 // Admin: 전체 사용자 목록
 router.get('/users', async (req, res) => {
     try {
-        const me = await resolveSessionUser(req, { allowGuestAdmin: true });
+        const me = await resolveSessionUser(req);
         if (me.role !== 'admin') return res.status(403).json({ error: '관리자 권한 필요' });
 
         try {

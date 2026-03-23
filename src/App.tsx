@@ -79,6 +79,8 @@ type AdminDatabaseView = 'stats' | 'graph' | 'distribution' | 'filters' | 'table
 type AdminSeriesKey = 'users' | 'stories' | 'messages';
 type PointTransactionType = 'welcome' | 'topup' | 'chat' | 'admin_grant' | 'admin_deduct' | 'refund' | 'adjustment';
 
+const APPLE_ADMIN_LOCAL_TOKEN = 'apple-admin-local';
+
 interface AdminUserRow {
     id: number;
     name: string;
@@ -783,16 +785,15 @@ export default function App() {
         }
 
         fetchMe().then(me => {
-            const initialView = window.history.state?.view || (window.location.pathname.replace('/', '') || 'home');
-            const isGuestSession = Boolean(me && me.id === 1 && me.name === '손님' && me.email === '' && me.role === 'admin');
-            if (me && !isGuestSession) {
+            if (me) {
                 setUser({ ...me, point_balance: Number(me.point_balance ?? 0) });
-                setView(normalizeView(String(initialView)));
+                setView('home');
                 loadStories();
             } else {
                 setUser(null);
+                setStories([]);
+                setPointData(null);
                 setView('home');
-                loadStories();
             }
         });
 
@@ -976,9 +977,24 @@ export default function App() {
     const logout = () => {
         localStorage.removeItem('token');
         setUser(null);
+        setStories([]);
+        setActiveStory(null);
+        setStoryMessages([]);
+        setForm({
+            title: '',
+            background: '',
+            environment: '',
+            is_public: false,
+            public_method: 'private',
+            cover_image_url: '',
+            characters: [],
+        });
         setPointData(null);
         setAdminPointDashboard(null);
         setAdminPointUserDetail(null);
+        setCommunityStories([]);
+        setCommunityError('');
+        setCommunityQuery('');
         pointDataLoadedForUserRef.current = null;
         adminPointDashboardLoadedRef.current = false;
         navigate('login');
@@ -1001,6 +1017,10 @@ export default function App() {
     };
 
     const openCommunity = async () => {
+        if (!user) {
+            navigate('login');
+            return;
+        }
         if (!communityStories.length && !communityLoading) {
             await loadCommunityStories();
         }
@@ -1280,7 +1300,7 @@ export default function App() {
     };
 
     useEffect(() => {
-        if (view !== 'admin' || adminDashboard || adminLoading) return;
+        if (view !== 'admin' || !user || user.role !== 'admin' || adminDashboard || adminLoading) return;
 
         let cancelled = false;
         const loadDashboard = async () => {
@@ -1304,12 +1324,12 @@ export default function App() {
         return () => {
             cancelled = true;
         };
-    }, [view, adminDashboard, adminLoading, loadAdminDashboard]);
+    }, [view, user, adminDashboard, adminLoading, loadAdminDashboard]);
 
     useEffect(() => {
-        if (view !== 'community' || communityStories.length || communityLoading) return;
+        if (view !== 'community' || !user || communityStories.length || communityLoading) return;
         void loadCommunityStories();
-    }, [view, communityStories.length, communityLoading, loadCommunityStories]);
+    }, [view, user, communityStories.length, communityLoading, loadCommunityStories]);
 
     useEffect(() => {
         if (!user || pointLoading) return;
@@ -1489,7 +1509,7 @@ export default function App() {
             </div>
             {user && (
                 <div className="nav-actions">
-                    <button className="btn btn-outline" style={{ fontSize: '0.85rem', padding: '0.4rem 0.8rem' }} onClick={() => navigate('points')}>
+                    <button className="btn nav-point-pill" onClick={() => navigate('points')}>
                         <Coins size={16} /> 포인트 {formatPointAmount(pointData?.pointBalance ?? user.point_balance)}
                     </button>
                     {user.role === 'admin' && (
@@ -1507,6 +1527,13 @@ export default function App() {
                     )}
                     <span className="text-muted" style={{ fontSize: '0.9rem' }}>{user.name}</span>
                     <button className="btn-icon" onClick={logout}><LogOut size={20} /></button>
+                </div>
+            )}
+            {!user && (
+                <div className="nav-actions">
+                    <button className="btn btn-primary" style={{ fontSize: '0.85rem', padding: '0.4rem 0.8rem' }} onClick={() => navigate('login')}>
+                        <Users size={16} /> 로그인
+                    </button>
                 </div>
             )}
         </nav>
@@ -1534,6 +1561,17 @@ export default function App() {
                     <a href={oauthUrl.google} className="btn" style={{ background: 'white', color: '#333', justifyContent: 'center', fontWeight: 600, border: '1px solid #ddd' }}>
                         구글로 로그인
                     </a>
+                    <button
+                        type="button"
+                        className="btn"
+                        style={{ background: '#111', color: 'white', justifyContent: 'center', fontWeight: 600 }}
+                        onClick={() => {
+                            localStorage.setItem('token', APPLE_ADMIN_LOCAL_TOKEN);
+                            window.location.assign('/');
+                        }}
+                    >
+                        애플로 관리자 로그인
+                    </button>
                 </div>
 
                 <p className="text-muted" style={{ fontSize: '0.78rem', marginTop: '2rem', lineHeight: 1.5 }}>
@@ -1571,235 +1609,317 @@ export default function App() {
                 </div>
             </div>
 
-            <div className="home-stats-grid" style={{ marginBottom: '1rem' }}>
-                <div className="glass-panel home-stat-card">
-                    <div className="home-stat-head">
-                        <span className="badge badge-gold">포인트</span>
-                        <Coins size={18} className="text-accent" />
-                    </div>
-                    <strong className="home-stat-value">{formatPointAmount(pointData?.pointBalance ?? user?.point_balance ?? 0)}</strong>
-                    <p className="text-muted">대화 1회당 {formatPointAmount(pointData?.chatCost ?? getChatCostForUser(user))} 차감됩니다.</p>
-                    <button
-                        className="btn btn-outline"
-                        style={{ marginTop: '0.85rem', width: '100%' }}
-                        onClick={() => navigate(user ? 'points' : 'login')}
-                    >
-                        {user ? '포인트 충전' : '로그인 후 충전'}
-                    </button>
-                </div>
-                <div className="glass-panel home-stat-card">
-                    <div className="home-stat-head">
-                        <span className="badge badge-green">이야기 보유</span>
-                        <BookOpen size={18} className="text-accent" />
-                    </div>
-                    <strong className="home-stat-value">{stories.length} / {getStoryLimitForUser(user)}</strong>
-                    <p className="text-muted">
-                        {stories.length >= getStoryLimitForUser(user)
-                            ? '보유 개수에 도달했습니다. 기존 이야기를 정리하거나 프리미엄을 확인해보세요.'
-                            : '이야기는 무료로 만들 수 있습니다. 프리미엄은 30개, 일반 회원은 3개까지 보유할 수 있어요.'}
-                    </p>
-                </div>
-            </div>
-
-            {stories.length === 0 ? (
-                <div className="glass-panel" style={{ textAlign: 'center', padding: '4rem 2rem' }}>
-                    <BookOpen size={60} className="text-muted" style={{ margin: '0 auto 1rem' }} />
-                    <p className="text-muted">아직 작성 중인 이야기가 없습니다.<br />새 이야기를 만들어 상상력을 펼쳐보세요!</p>
-                </div>
-            ) : (
-                <div className="char-grid">
-                    {stories.map(story => (
-                        <div className="char-card glass-panel" key={story.id}>
-                            <div className="char-info" style={{ paddingBottom: '1rem' }}>
-                                <h3 style={{ fontSize: '1.2rem', marginBottom: '0.5rem' }}>{story.title}</h3>
-                                <p className="text-muted" style={{ fontSize: '0.85rem', marginBottom: '0.5rem', minHeight: '40px' }}>
-                                    {story.background?.slice(0, 60) || '배경 설명이 없습니다.'}...
-                                </p>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                                    <Users size={14} className="text-accent" />
-                                    <span style={{ fontSize: '0.8rem', color: 'var(--accent)' }}>
-                                        등장인물 {story.characters?.length || 0}명
-                                    </span>
-                                </div>
-                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                                    {story.public_status === 'approved'
-                                        ? <Globe size={14} className="text-muted" />
-                                        : <Lock size={14} className="text-muted" />}
-                                    <span className="text-muted" style={{ fontSize: '0.75rem' }}>
-                                        {resolveStoryVisibilityInfo({
-                                            isPublic: story.is_public ? 1 : 0,
-                                            publicStatus: story.public_status || null,
-                                            publicMethod: story.public_method || null,
-                                        }).label}
-                                    </span>
-                                </div>
-                                {story.public_status === 'rejected' && story.public_review_message && (
-                                    <p className="text-muted" style={{ marginTop: '0.4rem', fontSize: '0.75rem', lineHeight: 1.4 }}>
-                                        반려 사유: {story.public_review_message}
-                                    </p>
-                                )}
+            {user ? (
+                <>
+                    <div className="home-stats-grid" style={{ marginBottom: '1rem' }}>
+                        <div className="glass-panel home-stat-card">
+                            <div className="home-stat-head">
+                                <span className="badge badge-green">이야기 보유</span>
+                                <BookOpen size={18} className="text-accent" />
                             </div>
-                            <div className="char-actions">
-                                <button className="btn btn-primary" style={{ flex: 1 }} onClick={() => openStoryReader(story)}>
-                                    <BookOpen size={16} /> 이어쓰기
+                            <strong className="home-stat-value">{stories.length} / {getStoryLimitForUser(user)}</strong>
+                            <p className="text-muted">
+                                {stories.length >= getStoryLimitForUser(user)
+                                    ? '보유 개수에 도달했습니다. 기존 이야기를 정리하거나 프리미엄을 확인해보세요.'
+                                    : '이야기는 무료로 만들 수 있습니다. 프리미엄은 30개, 일반 회원은 3개까지 보유할 수 있어요.'}
+                            </p>
+                            <button
+                                className="btn btn-outline"
+                                style={{ marginTop: '0.85rem', width: '100%' }}
+                                onClick={openNewStory}
+                                disabled={stories.length >= getStoryLimitForUser(user)}
+                            >
+                                새 이야기 만들기
+                            </button>
+                        </div>
+                        <div className="glass-panel home-stat-card">
+                            <div className="home-stat-head">
+                                <span className="badge badge-gold">빠른 이동</span>
+                                <Sparkles size={18} className="text-accent" />
+                            </div>
+                            <strong className="home-stat-value">메인 바로가기</strong>
+                            <p className="text-muted">상단바의 포인트 배지와 관리자/커뮤니티 메뉴로 이동할 수 있습니다.</p>
+                            <div style={{ display: 'flex', gap: '0.6rem', marginTop: '0.85rem', flexWrap: 'wrap' }}>
+                                <button className="btn btn-outline" style={{ flex: 1 }} onClick={() => navigate('points')}>
+                                    포인트
                                 </button>
-                                <button className="btn btn-outline" onClick={() => openEditStory(story)}>
-                                    <Settings size={16} />
-                                </button>
-                                <button className="btn btn-outline" style={{ color: '#f87171', borderColor: '#f87171' }} onClick={() => removeStory(story.id)}>
-                                    <Trash2 size={16} />
+                                <button className="btn btn-outline" style={{ flex: 1 }} onClick={() => void openCommunity()}>
+                                    커뮤니티
                                 </button>
                             </div>
                         </div>
-                    ))}
+                    </div>
+
+                    {stories.length === 0 ? (
+                        <div className="glass-panel" style={{ textAlign: 'center', padding: '4rem 2rem' }}>
+                            <BookOpen size={60} className="text-muted" style={{ margin: '0 auto 1rem' }} />
+                            <p className="text-muted">아직 작성 중인 이야기가 없습니다.<br />새 이야기를 만들어 상상력을 펼쳐보세요!</p>
+                        </div>
+                    ) : (
+                        <div className="char-grid">
+                            {stories.map(story => (
+                                <div className="char-card glass-panel" key={story.id}>
+                                    <div className="char-info" style={{ paddingBottom: '1rem' }}>
+                                        <h3 style={{ fontSize: '1.2rem', marginBottom: '0.5rem' }}>{story.title}</h3>
+                                        <p className="text-muted" style={{ fontSize: '0.85rem', marginBottom: '0.5rem', minHeight: '40px' }}>
+                                            {story.background?.slice(0, 60) || '배경 설명이 없습니다.'}...
+                                        </p>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                                            <Users size={14} className="text-accent" />
+                                            <span style={{ fontSize: '0.8rem', color: 'var(--accent)' }}>
+                                                등장인물 {story.characters?.length || 0}명
+                                            </span>
+                                        </div>
+                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                            {story.public_status === 'approved'
+                                                ? <Globe size={14} className="text-muted" />
+                                                : <Lock size={14} className="text-muted" />}
+                                            <span className="text-muted" style={{ fontSize: '0.75rem' }}>
+                                                {resolveStoryVisibilityInfo({
+                                                    isPublic: story.is_public ? 1 : 0,
+                                                    publicStatus: story.public_status || null,
+                                                    publicMethod: story.public_method || null,
+                                                }).label}
+                                            </span>
+                                        </div>
+                                        {story.public_status === 'rejected' && story.public_review_message && (
+                                            <p className="text-muted" style={{ marginTop: '0.4rem', fontSize: '0.75rem', lineHeight: 1.4 }}>
+                                                반려 사유: {story.public_review_message}
+                                            </p>
+                                        )}
+                                    </div>
+                                    <div className="char-actions">
+                                        <button className="btn btn-primary" style={{ flex: 1 }} onClick={() => openStoryReader(story)}>
+                                            <BookOpen size={16} /> 이어쓰기
+                                        </button>
+                                        <button className="btn btn-outline" onClick={() => openEditStory(story)}>
+                                            <Settings size={16} />
+                                        </button>
+                                        <button className="btn btn-outline" style={{ color: '#f87171', borderColor: '#f87171' }} onClick={() => removeStory(story.id)}>
+                                            <Trash2 size={16} />
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </>
+            ) : (
+                <div className="landing-shell">
+                    <div className="glass-panel landing-hero">
+                        <div className="landing-hero-copy">
+                            <span className="badge badge-gold">비로그인 방문자</span>
+                            <h2 className="title-font landing-title">이야기는 가볍게, 로그인은 필요할 때만</h2>
+                            <p className="text-muted landing-subtitle">
+                                누구나 분위기를 둘러볼 수 있는 첫 화면입니다. 로그인하면 내 이야기, 포인트, 관리자 기능이 바로 열립니다.
+                            </p>
+                            <div className="landing-actions">
+                                <button className="btn btn-primary" onClick={() => navigate('login')}>
+                                    <Users size={18} /> 로그인하기
+                                </button>
+                                <button className="btn btn-outline" onClick={() => navigate('community')}>
+                                    <Globe size={18} /> 둘러보기
+                                </button>
+                            </div>
+                        </div>
+                        <div className="landing-feature-grid">
+                            <div className="glass-panel landing-feature-card">
+                                <BookOpen size={24} className="text-accent" />
+                                <strong>이야기 생성</strong>
+                                <p className="text-muted">무료로 이야기와 주인공을 만들 수 있습니다.</p>
+                            </div>
+                            <div className="glass-panel landing-feature-card">
+                                <Coins size={24} className="text-accent" />
+                                <strong>포인트 충전</strong>
+                                <p className="text-muted">로그인 후 채팅 비용과 충전 내역을 확인합니다.</p>
+                            </div>
+                            <div className="glass-panel landing-feature-card">
+                                <ShieldAlert size={24} className="text-accent" />
+                                <strong>관리자 접근</strong>
+                                <p className="text-muted">Apple 버튼으로 관리자로 접속할 수 있습니다.</p>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             )}
         </div>
     );
 
-    const renderCommunity = () => (
-        <div className="main-content fade-in">
-            {(() => {
-                const countFmt = new Intl.NumberFormat('ko-KR');
-                const query = communityQuery.trim().toLowerCase();
-                const filteredStories = communityStories
-                    .filter((story) => {
-                        if (!query) return true;
-                        return [
-                            story.title,
-                            story.background,
-                            story.environment,
-                            story.authorName,
-                            story.authorRole,
-                            story.id,
-                        ].some((value) => String(value ?? '').toLowerCase().includes(query));
-                    })
-                    .slice()
-                    .sort((a, b) => {
-                        if (communitySort === 'oldest') return new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime();
-                        if (communitySort === 'title') return a.title.localeCompare(b.title, 'ko-KR');
-                        if (communitySort === 'author') return (a.authorName || '').localeCompare(b.authorName || '', 'ko-KR');
-                        return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
-                    });
-
-                return (
-                    <>
-                        <div className="admin-hero glass-panel" style={{ marginBottom: '1rem' }}>
-                            <div>
-                                <div className="admin-hero-title">
-                                    <Globe size={22} className="text-accent" />
-                                    <h1 className="title-font" style={{ fontSize: '1.6rem' }}>커뮤니티</h1>
-                                </div>
-                                <p className="text-muted" style={{ marginTop: '0.5rem' }}>
-                                    관리자 승인 공개와 직접 공개 작품을 함께 모아 봅니다.
-                                </p>
-                            </div>
-                            <div className="admin-hero-actions">
-                                <button className="btn btn-outline" onClick={() => void loadCommunityStories()} disabled={communityLoading}>
-                                    <RefreshCw size={16} /> 새로고침
-                                </button>
-                                <button className="btn btn-outline" onClick={() => navigate('home')}>
-                                    <ChevronLeft size={16} /> 내 작품
-                                </button>
-                            </div>
+    const renderCommunity = () => {
+        if (!user) {
+            return (
+                <div className="main-content fade-in">
+                    <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center' }}>
+                        <Globe size={56} className="text-accent" style={{ margin: '0 auto 1rem' }} />
+                        <h2 className="title-font" style={{ fontSize: '1.4rem', marginBottom: '0.5rem' }}>로그인이 필요합니다</h2>
+                        <p className="text-muted" style={{ lineHeight: 1.7 }}>
+                            커뮤니티 작품은 로그인 후 확인할 수 있습니다.
+                        </p>
+                        <div style={{ marginTop: '1.2rem' }}>
+                            <button className="btn btn-primary" onClick={() => navigate('login')}>
+                                <Users size={18} /> 로그인
+                            </button>
                         </div>
+                    </div>
+                </div>
+            );
+        }
 
-                        <div className="glass-panel community-toolbar" style={{ marginBottom: '1rem' }}>
-                            <div className="community-toolbar-search">
-                                <Search size={16} className="text-muted" />
-                                <input
-                                    className="admin-search-input"
-                                    placeholder="제목, 작가, 배경, 환경 검색"
-                                    value={communityQuery}
-                                    onChange={(e) => setCommunityQuery(e.target.value)}
-                                />
+        const countFmt = new Intl.NumberFormat('ko-KR');
+        const query = communityQuery.trim().toLowerCase();
+        const filteredStories = communityStories
+            .filter((story) => {
+                if (!query) return true;
+                return [
+                    story.title,
+                    story.background,
+                    story.environment,
+                    story.authorName,
+                    story.authorRole,
+                    story.id,
+                ].some((value) => String(value ?? '').toLowerCase().includes(query));
+            })
+            .slice()
+            .sort((a, b) => {
+                if (communitySort === 'oldest') return new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime();
+                if (communitySort === 'title') return a.title.localeCompare(b.title, 'ko-KR');
+                if (communitySort === 'author') return (a.authorName || '').localeCompare(b.authorName || '', 'ko-KR');
+                return new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+            });
+
+        return (
+            <div className="main-content fade-in">
+                <div className="admin-hero glass-panel" style={{ marginBottom: '1rem' }}>
+                    <div>
+                        <div className="admin-hero-title">
+                            <Globe size={22} className="text-accent" />
+                            <h1 className="title-font" style={{ fontSize: '1.6rem' }}>커뮤니티</h1>
+                        </div>
+                        <p className="text-muted" style={{ marginTop: '0.5rem' }}>
+                            관리자 승인 공개와 직접 공개 작품을 함께 모아 봅니다.
+                        </p>
+                    </div>
+                    <div className="admin-hero-actions">
+                        <button className="btn btn-outline" onClick={() => void loadCommunityStories()} disabled={communityLoading}>
+                            <RefreshCw size={16} /> 새로고침
+                        </button>
+                        <button className="btn btn-outline" onClick={() => navigate('home')}>
+                            <ChevronLeft size={16} /> 내 작품
+                        </button>
+                    </div>
+                </div>
+
+                <div className="glass-panel community-toolbar" style={{ marginBottom: '1rem' }}>
+                    <div className="community-toolbar-search">
+                        <Search size={16} className="text-muted" />
+                        <input
+                            className="admin-search-input"
+                            placeholder="제목, 작가, 배경, 환경 검색"
+                            value={communityQuery}
+                            onChange={(e) => setCommunityQuery(e.target.value)}
+                        />
+                    </div>
+                    <div className="community-toolbar-actions">
+                        <label>
+                            <span>정렬</span>
+                            <select
+                                className="input-control"
+                                value={communitySort}
+                                onChange={(e) => setCommunitySort(e.target.value as typeof communitySort)}
+                            >
+                                <option value="latest">최신순</option>
+                                <option value="oldest">오래된 순</option>
+                                <option value="title">제목순</option>
+                                <option value="author">작가순</option>
+                            </select>
+                        </label>
+                        <div className="community-toolbar-meta text-muted">
+                            총 {countFmt.format(communityStories.length)}편 · 검색 {countFmt.format(filteredStories.length)}편
+                        </div>
+                    </div>
+                </div>
+
+                {communityError && (
+                    <div className="glass-panel" style={{ borderColor: '#ef4444', background: 'rgba(239,68,68,0.08)', marginBottom: '1rem' }}>
+                        <strong>커뮤니티 불러오기 실패</strong>
+                        <p className="text-muted" style={{ marginTop: '0.35rem' }}>{communityError}</p>
+                    </div>
+                )}
+
+                {communityLoading && communityStories.length === 0 ? (
+                    <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center' }}>
+                        <p className="text-muted">커뮤니티 작품을 불러오는 중입니다...</p>
+                    </div>
+                ) : filteredStories.length === 0 ? (
+                    <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center' }}>
+                        <p className="text-muted">
+                            {communityStories.length === 0 ? '아직 공개된 작품이 없습니다.' : '검색 조건에 맞는 작품이 없습니다.'}
+                        </p>
+                    </div>
+                ) : (
+                    <div className="community-grid">
+                        {filteredStories.map((story) => (
+                            <div key={story.id} className="community-card glass-panel">
+                                <div
+                                    className={`community-cover ${story.coverImageUrl ? '' : 'is-placeholder'}`}
+                                    style={{ backgroundImage: story.coverImageUrl ? `url(${story.coverImageUrl})` : 'linear-gradient(180deg, #2f2f45 0%, #141825 100%)' }}
+                                >
+                                    {!story.coverImageUrl && <span>표지 없음</span>}
                                 </div>
-                                <div className="community-toolbar-actions">
-                                    <label>
-                                        <span>정렬</span>
-                                        <select
-                                        className="input-control"
-                                        value={communitySort}
-                                        onChange={(e) => setCommunitySort(e.target.value as typeof communitySort)}
-                                    >
-                                        <option value="latest">최신순</option>
-                                        <option value="oldest">오래된 순</option>
-                                        <option value="title">제목순</option>
-                                        <option value="author">작가순</option>
-                                    </select>
-                                    </label>
-                                    <div className="community-toolbar-meta text-muted">
-                                    총 {countFmt.format(communityStories.length)}편 · 검색 {countFmt.format(filteredStories.length)}편
-                                    </div>
-                                </div>
-                            </div>
-
-                        {communityError && (
-                            <div className="glass-panel" style={{ borderColor: '#ef4444', background: 'rgba(239,68,68,0.08)', marginBottom: '1rem' }}>
-                                <strong>커뮤니티 불러오기 실패</strong>
-                                <p className="text-muted" style={{ marginTop: '0.35rem' }}>{communityError}</p>
-                            </div>
-                        )}
-
-                        {communityLoading && communityStories.length === 0 ? (
-                            <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center' }}>
-                                <p className="text-muted">커뮤니티 작품을 불러오는 중입니다...</p>
-                            </div>
-                        ) : filteredStories.length === 0 ? (
-                            <div className="glass-panel" style={{ padding: '3rem', textAlign: 'center' }}>
-                                <p className="text-muted">
-                                    {communityStories.length === 0 ? '아직 공개된 작품이 없습니다.' : '검색 조건에 맞는 작품이 없습니다.'}
-                                </p>
-                            </div>
-                        ) : (
-                            <div className="community-grid">
-                                {filteredStories.map((story) => (
-                                    <div key={story.id} className="community-card glass-panel">
-                                        <div
-                                            className={`community-cover ${story.coverImageUrl ? '' : 'is-placeholder'}`}
-                                            style={{ backgroundImage: story.coverImageUrl ? `url(${story.coverImageUrl})` : 'linear-gradient(180deg, #2f2f45 0%, #141825 100%)' }}
-                                        >
-                                            {!story.coverImageUrl && <span>표지 없음</span>}
-                                        </div>
-                                        <div className="community-card-body">
-                                            <div className="community-card-head">
-                                                <div>
-                                                    <h3>{story.title}</h3>
-                                                    <p className="text-muted community-card-sub">
-                                                        {story.authorName || '알 수 없음'} · {story.environment || '환경 미설정'}
-                                                    </p>
-                                                </div>
-                                                <span className={`badge ${resolveStoryVisibilityInfo({
-                                                    isPublic: story.isPublic,
-                                                    publicStatus: story.publicStatus || null,
-                                                    publicMethod: story.publicMethod || null,
-                                                }).badge}`}>
-                                                    {resolveStoryVisibilityInfo({
-                                                        isPublic: story.isPublic,
-                                                        publicStatus: story.publicStatus || null,
-                                                        publicMethod: story.publicMethod || null,
-                                                    }).label}
-                                                </span>
-                                            </div>
-                                            <p className="community-card-text">
-                                                {story.background || '배경 설명이 없습니다.'}
+                                <div className="community-card-body">
+                                    <div className="community-card-head">
+                                        <div>
+                                            <h3>{story.title}</h3>
+                                            <p className="text-muted community-card-sub">
+                                                {story.authorName || '알 수 없음'} · {story.environment || '환경 미설정'}
                                             </p>
-                                            <div className="community-card-meta">
-                                                <span>업데이트 {story.updatedAt.slice(0, 10)}</span>
-                                                <span>작가 {story.authorRole || 'user'}</span>
-                                            </div>
                                         </div>
+                                        <span className={`badge ${resolveStoryVisibilityInfo({
+                                            isPublic: story.isPublic,
+                                            publicStatus: story.publicStatus || null,
+                                            publicMethod: story.publicMethod || null,
+                                        }).badge}`}>
+                                            {resolveStoryVisibilityInfo({
+                                                isPublic: story.isPublic,
+                                                publicStatus: story.publicStatus || null,
+                                                publicMethod: story.publicMethod || null,
+                                            }).label}
+                                        </span>
                                     </div>
-                                ))}
+                                    <p className="community-card-text">
+                                        {story.background || '배경 설명이 없습니다.'}
+                                    </p>
+                                    <div className="community-card-meta">
+                                        <span>업데이트 {story.updatedAt.slice(0, 10)}</span>
+                                        <span>작가 {story.authorRole || 'user'}</span>
+                                    </div>
+                                </div>
                             </div>
-                        )}
-                    </>
-                );
-            })()}
-        </div>
-    );
+                        ))}
+                    </div>
+                )}
+            </div>
+        );
+    };
 
     const renderPoints = () => {
+        if (!user) {
+            return (
+                <div className="main-content fade-in" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60vh' }}>
+                    <div className="glass-panel" style={{ width: 'min(100%, 420px)', textAlign: 'center', padding: '2.5rem' }}>
+                        <Coins size={48} className="text-accent" style={{ margin: '0 auto 1rem' }} />
+                        <h1 className="title-font" style={{ fontSize: '1.6rem', marginBottom: '0.5rem' }}>로그인이 필요합니다</h1>
+                        <p className="text-muted" style={{ lineHeight: 1.7 }}>
+                            포인트 충전과 사용 내역은 로그인 후 확인할 수 있습니다.
+                        </p>
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '1.5rem' }} onClick={() => navigate('login')}>
+                            로그인하기
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
         const pointBalance = pointData?.pointBalance ?? user?.point_balance ?? 0;
         const chatCost = pointData?.chatCost ?? getChatCostForUser(user);
         const storyLimit = pointData?.storyLimit ?? getStoryLimitForUser(user);
@@ -1973,6 +2093,23 @@ export default function App() {
 
     // ── Studio: story & character creation/edit ──────────────────────
     const renderStudio = () => {
+        if (!user) {
+            return (
+                <div className="main-content fade-in" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60vh' }}>
+                    <div className="glass-panel" style={{ width: 'min(100%, 420px)', textAlign: 'center', padding: '2.5rem' }}>
+                        <BookOpen size={48} className="text-accent" style={{ margin: '0 auto 1rem' }} />
+                        <h1 className="title-font" style={{ fontSize: '1.6rem', marginBottom: '0.5rem' }}>로그인이 필요합니다</h1>
+                        <p className="text-muted" style={{ lineHeight: 1.7 }}>
+                            이야기를 만들고 주인공을 설정하려면 먼저 로그인해주세요.
+                        </p>
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '1.5rem' }} onClick={() => navigate('login')}>
+                            로그인하기
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
         type CharacterMultiField = 'personality' | 'speechStyles' | 'behaviorRules' | 'likes' | 'dislikes' | 'goals';
         type CharacterTextField = 'customBehaviorRules' | 'customDislikes' | 'customGoals' | 'background';
 
@@ -2439,6 +2576,23 @@ export default function App() {
 
     // ── Story Writer view ─────────────────────────────────────────
     const renderChat = () => {
+        if (!user) {
+            return (
+                <div className="main-content fade-in" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60vh' }}>
+                    <div className="glass-panel" style={{ width: 'min(100%, 420px)', textAlign: 'center', padding: '2.5rem' }}>
+                        <MessageSquareText size={48} className="text-accent" style={{ margin: '0 auto 1rem' }} />
+                        <h1 className="title-font" style={{ fontSize: '1.6rem', marginBottom: '0.5rem' }}>로그인이 필요합니다</h1>
+                        <p className="text-muted" style={{ lineHeight: 1.7 }}>
+                            대화와 집필은 로그인 후 이용할 수 있습니다.
+                        </p>
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '1.5rem' }} onClick={() => navigate('login')}>
+                            로그인하기
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
         const userColorStr = `rgb(${readerSettings.userColorR}, ${readerSettings.userColorG}, ${readerSettings.userColorB})`;
         const aiColorStr = `rgb(${readerSettings.aiColorR}, ${readerSettings.aiColorG}, ${readerSettings.aiColorB})`;
         const visibleStoryMessages = readerSettings.hideUserText
@@ -2703,6 +2857,23 @@ export default function App() {
 
     // ── Admin view ───────────────────────────────────────────
     const renderAdmin = () => {
+        if (!user || user.role !== 'admin') {
+            return (
+                <div className="main-content fade-in" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60vh' }}>
+                    <div className="glass-panel" style={{ width: 'min(100%, 420px)', textAlign: 'center', padding: '2.5rem' }}>
+                        <ShieldAlert size={48} className="text-accent" style={{ margin: '0 auto 1rem' }} />
+                        <h1 className="title-font" style={{ fontSize: '1.6rem', marginBottom: '0.5rem' }}>관리자 권한이 필요합니다</h1>
+                        <p className="text-muted" style={{ lineHeight: 1.7 }}>
+                            Apple 버튼으로 관리자 로그인 후 이용할 수 있습니다.
+                        </p>
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '1.5rem' }} onClick={() => navigate('login')}>
+                            로그인하기
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
         const dashboard = adminDashboard;
         const summary = dashboard?.summary;
         const databaseStats = dashboard?.databaseStats;
