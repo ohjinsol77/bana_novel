@@ -520,6 +520,12 @@ textarea.input-control {
   border: 1px solid var(--border-color);
   background: var(--bg-surface);
   color: var(--text-main);
+  font: inherit;
+  text-align: left;
+  justify-content: flex-start;
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s, transform 0.15s;
 }
@@ -543,6 +549,11 @@ textarea.input-control {
 .choice-chip span {
   font-size: 0.88rem;
   line-height: 1.45;
+}
+
+.choice-chip:focus-visible {
+  outline: 2px solid rgba(124, 92, 252, 0.55);
+  outline-offset: 2px;
 }
 
 .character-head-row {
@@ -2785,6 +2796,7 @@ textarea.input-control {
   aspect-ratio: 148 / 210;
   background: linear-gradient(180deg, #fffaf1 0%, #f4eadb 100%);
   color: var(--book-text);
+  box-sizing: border-box;
   border: 1px solid rgba(80, 60, 30, 0.08);
   border-radius: 12px;
   box-shadow: 0 28px 60px rgba(0, 0, 0, 0.28), inset 0 0 80px rgba(0, 0, 0, 0.03);
@@ -2935,11 +2947,12 @@ textarea.input-control {
 .binding-body-layout.is-compact .binding-message {
   margin: 0;
   line-height: 1.45;
-  text-align: justify;
-  text-justify: inter-word;
-  text-indent: 1.1em;
+  text-align: left;
+  text-justify: auto;
+  text-indent: 0;
   color: #2d1f11;
   word-break: keep-all;
+  overflow-wrap: break-word;
 }
 
 .binding-body-layout.is-compact .binding-message-user,
@@ -2994,7 +3007,8 @@ textarea.input-control {
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  padding-right: 0.2rem;
+  box-sizing: border-box;
+  padding: 0 0.2rem 0.2rem 0;
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
@@ -3017,7 +3031,7 @@ textarea.input-control {
 
 .binding-message {
   max-width: 100%;
-  margin-bottom: 0.45rem;
+  margin-bottom: 0.22rem;
   line-height: 1.6;
   white-space: pre-wrap;
   word-break: break-word;
@@ -3162,14 +3176,16 @@ textarea.input-control {
 }
 
 .binding-print-page-number {
-  display: none;
-  position: absolute;
-  right: 9mm;
-  bottom: 8mm;
-  font-size: 0.82rem;
+  display: block;
+  align-self: flex-end;
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+  font-size: 0.68rem;
   font-weight: 700;
+  line-height: 1;
   letter-spacing: 0.02em;
   color: rgba(45, 29, 99, 0.95);
+  opacity: 0.9;
   pointer-events: none;
 }
 
@@ -3254,6 +3270,7 @@ textarea.input-control {
     width: 148mm !important;
     height: 210mm !important;
     aspect-ratio: auto !important;
+    box-sizing: border-box !important;
     box-shadow: none !important;
     border: none !important;
     border-radius: 0 !important;
@@ -3264,10 +3281,6 @@ textarea.input-control {
 
   .binding-manuscript {
     overflow: hidden !important;
-  }
-
-  .binding-print-page-number {
-    display: block !important;
   }
 
   @page {

@@ -3,7 +3,8 @@ import pool from '../db.js';
 import { adjustUserPointBalance, getStoryLimitForUser } from '../db.js';
 import { hydrateCharacterRow, serializeCharacterPayload } from '../persona.js';
 import { resolveSessionUser } from '../session.js';
-import { buildBindingPages, normalizeBindingOptions } from '../../shared/binding-layout.js';
+import { normalizeBindingOptions } from '../../shared/binding-layout.js';
+import { buildBindingExportContext } from '../services/binding-export.js';
 
 const router = express.Router();
 
@@ -188,32 +189,19 @@ async function loadBindingExportContext(conn, storyId, userId, bindingOptions) {
         };
     }
 
-    const pages = buildBindingPages({
-        title: story.title || '',
-        background: story.background || '',
-        environment: story.environment || '',
-        messages: messageRows,
-        viewerSettings,
-        options: bindingOptions,
-    });
-    const pageCount = pages.length;
-    const cost = pageCount;
-
     const [balanceRows] = await conn.query(
         'SELECT point_balance AS pointBalance FROM users WHERE id=? LIMIT 1',
         [userId]
     );
     const currentBalance = Number(balanceRows[0]?.pointBalance ?? 0);
 
-    return {
+    return buildBindingExportContext({
         story,
-        viewerSettings,
         messageRows,
-        pages,
-        pageCount,
-        cost,
+        viewerSettings,
+        options: bindingOptions,
         currentBalance,
-    };
+    });
 }
 
 router.post('/:id/binding/prepare', auth, async (req, res) => {
@@ -279,6 +267,7 @@ router.post('/:id/binding/prepare', auth, async (req, res) => {
                 pageCount: context.pageCount,
                 cost: context.cost,
                 pages: context.pages,
+                renderChecks: context.renderChecks,
             },
         });
     } catch (err) {
@@ -412,7 +401,7 @@ router.post('/', auth, async (req, res) => {
     try {
         await conn.beginTransaction();
 
-        const { title, background, environment, is_public, public_method, characters } = req.body;
+        const { title, background, environment, cover_image_url, characters } = req.body;
 
         if (!title) throw new Error('이야기 제목은 필수입니다.');
         if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
@@ -429,7 +418,7 @@ router.post('/', auth, async (req, res) => {
             throw error;
         }
 
-        const publicState = resolvePublicStoryState(null, public_method, Boolean(is_public), req.user);
+        const publicState = resolvePublicStoryState(null, 'private', false, req.user);
 
         // 1. 이야기(방) 생성
         const [storyResult] = await conn.query(
@@ -449,7 +438,7 @@ router.post('/', auth, async (req, res) => {
                 publicState.public_reviewed_at,
                 publicState.public_reviewed_by,
                 publicState.public_review_message,
-                null,
+                typeof cover_image_url === 'string' && cover_image_url ? cover_image_url : null,
             ]
         );
         const storyId = storyResult.insertId;
@@ -509,8 +498,8 @@ router.put('/:id', auth, async (req, res) => {
         if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
         const currentStory = check[0];
         const publicState = resolvePublicStoryState(currentStory, public_method, Boolean(is_public), req.user);
-        const nextCoverImageUrl = normalizePublicStatus(currentStory.public_status) === 'approved' && typeof cover_image_url === 'string'
-            ? cover_image_url
+        const nextCoverImageUrl = typeof cover_image_url === 'string'
+            ? (cover_image_url || null)
             : currentStory.cover_image_url || null;
 
         // 1. 이야기 메인 정보 업데이트

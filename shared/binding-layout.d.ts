@@ -28,7 +28,9 @@ export interface BindingViewerSettings {
 }
 
 export function getBindingBodyBudget(viewerSettings?: BindingViewerSettings | null): number;
+export function normalizeBindingText(text: string): string;
 export function estimateBindingTextCost(text: string, role: 'user' | 'assistant'): number;
+export function calculateBindingPointCost(pageCount: number, bindingPointCostPerPage?: number): number;
 export function splitBindingText(text: string, budget: number): string[];
 export function buildBindingPages(payload: {
     title: string;

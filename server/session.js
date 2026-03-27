@@ -26,6 +26,7 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
             can_publish_community: true,
             phone_number: null,
             phone_verified_at: null,
+            pass_verified_at: null,
             adult_verified_at: null,
             birth_date: null,
             point_balance: 0,
@@ -51,6 +52,7 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
                 can_publish_community: false,
                 phone_number: null,
                 phone_verified_at: null,
+                pass_verified_at: null,
                 adult_verified_at: null,
                 birth_date: null,
                 point_balance: 0,
@@ -72,7 +74,7 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
     }
 
     const [rows] = await pool.query(
-        'SELECT id, name, email, provider, role, is_adult, is_premium, is_suspended, can_publish_community, phone_number, phone_verified_at, adult_verified_at, birth_date, point_balance FROM users WHERE id=? LIMIT 1',
+        'SELECT id, name, email, provider, role, is_adult, is_premium, is_suspended, can_publish_community, phone_number, phone_verified_at, pass_verified_at, adult_verified_at, birth_date, point_balance FROM users WHERE id=? LIMIT 1',
         [payload.id]
     );
 
@@ -84,6 +86,12 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
     if (Number(user.is_suspended) === 1) {
         throw createSessionError('정지된 계정입니다.', 403, 'SUSPENDED');
     }
+
+    const [linkedRows] = await pool.query(
+        'SELECT provider FROM user_oauth_identities WHERE user_id=? ORDER BY provider',
+        [user.id]
+    );
+    const linkedProviders = linkedRows.map((row) => row.provider);
 
     const sessionUser = {
         id: user.id,
@@ -97,8 +105,10 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
         can_publish_community: Boolean(user.can_publish_community),
         phone_number: user.phone_number || null,
         phone_verified_at: user.phone_verified_at || null,
+        pass_verified_at: user.pass_verified_at || null,
         adult_verified_at: user.adult_verified_at || null,
         birth_date: user.birth_date || null,
+        linked_providers: linkedProviders,
         point_balance: Number(user.point_balance) || 0,
     };
 

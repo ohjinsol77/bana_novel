@@ -13,12 +13,15 @@ import {
     fetchAdminDashboard, fetchAdminStoryDetail, updateAdminStoryVisibility, reviewAdminStory,
     deleteAdminStory, updateAdminUser, oauthUrl, updateStorySettings,
     fetchMyPoints, topUpPoints, fetchAdminPointDashboard, fetchAdminPointUser, adjustAdminUserPoints,
+    updateAdminPointSettings,
     updateStoryMessage,
-    requestPhoneVerification, verifyPhoneCode, registerLocalUser, loginLocalUser,
-    completePhoneVerification, completeAdultVerification,
+    registerLocalUser, loginLocalUser,
+    requestPassVerification, verifyPassCode,
+    completePassVerification, completeAdultVerification,
+    startOauthLink,
     prepareStoryBinding, finalizeStoryBinding,
 } from './api';
-import { DEFAULT_BINDING_OPTIONS, buildBindingPages, estimateBindingPageCount, getBindingBodyBudget, normalizeBindingOptions } from '../shared/binding-layout.js';
+import { DEFAULT_BINDING_OPTIONS, buildBindingPages, calculateBindingPointCost, estimateBindingPageCount, getBindingBodyBudget, normalizeBindingOptions } from '../shared/binding-layout.js';
 import './index.css';
 
 // ── Types ───────────────────────────────────────────────────
@@ -33,8 +36,10 @@ interface AuthUser {
     can_publish_community: boolean;
     phone_number?: string | null;
     phone_verified_at?: string | null;
+    pass_verified_at?: string | null;
     adult_verified_at?: string | null;
     birth_date?: string | null;
+    linked_providers?: string[];
     point_balance: number;
 }
 
@@ -54,6 +59,7 @@ export interface StoryCharacter {
     behaviorRules: string[];
     customBehaviorRules: string;
     likes: string[];
+    customLikes: string;
     dislikes: string[];
     customDislikes: string;
     relationship: string;
@@ -160,12 +166,20 @@ interface PointMeData {
     storyLimit: number;
     storyCount: number;
     canCharge: boolean;
-    identityVerified?: boolean;
+    passVerified?: boolean;
     adultVerified?: boolean;
+    pointSettings?: PointCostSettings;
     recentTransactions: PointTransactionRow[];
 }
 
+interface PointCostSettings {
+    chatPointCost: number;
+    premiumChatPointCost: number;
+    bindingPointCostPerPage: number;
+}
+
 interface AdminPointDashboard {
+    pointSettings?: PointCostSettings;
     summary: {
         userCount: number;
         premiumUserCount: number;
@@ -276,6 +290,21 @@ interface BindingSession {
     authorName?: string | null;
     createdAt?: string | null;
     pages: BindingPage[];
+    generatedBy?: 'client' | 'server';
+    renderChecks?: {
+        warnings?: string[];
+        messageReports?: Array<{
+            messageId: number;
+            role: 'user' | 'assistant';
+            originalParagraphCount?: number;
+            formattedParagraphCount?: number;
+            mergedLineBreaks?: number;
+            attachedStandaloneQuotes?: number;
+            skippedBlankLines?: number;
+            warnings?: string[];
+        }>;
+        normalizedMessageCount?: number;
+    };
 }
 
 interface BindingPageBlock {
@@ -401,10 +430,16 @@ interface ReaderSettings {
 }
 
 const MAX_CHARACTERS = 7;
-const LONG_TEXT_LIMIT = 1500;
-const PERSONALITY_LIMIT = 5;
-const SPEECH_STYLE_LIMIT = 3;
-const LIKES_LIMIT = 5;
+const PERSONALITY_LIMIT = 3;
+const SPEECH_STYLE_LIMIT = 2;
+const BEHAVIOR_RULE_LIMIT = 2;
+const LIKES_LIMIT = 2;
+const DISLIKE_LIMIT = 2;
+const STORY_ROLE_LIMIT = 1;
+const CHARACTER_BEHAVIOR_LIMIT = 300;
+const CHARACTER_LIKE_MEMO_LIMIT = 100;
+const CHARACTER_DISLIKE_LIMIT = 100;
+const CHARACTER_BACKGROUND_LIMIT = 500;
 const COVER_IMAGE_WIDTH = 800;
 const COVER_IMAGE_HEIGHT = 1200;
 const COVER_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
@@ -498,14 +533,6 @@ const RELATIONSHIP_OPTIONS = [
     { label: '가이드', value: 'guide' },
 ];
 
-const GOAL_OPTIONS = [
-    { label: '이야기 속 인물들과 친해지기', value: 'build_friendship' },
-    { label: '재미있는 대화', value: 'fun_conversation' },
-    { label: '도움 주기', value: 'provide_help' },
-    { label: '정보 제공', value: 'provide_information' },
-    { label: '감정 교류', value: 'emotional_support' },
-];
-
 const DEFAULT_READER_SETTINGS: ReaderSettings = {
     aspectRatio: 'tall',
     fontFamily: 'Gowun Batang',
@@ -519,7 +546,7 @@ const DEFAULT_READER_SETTINGS: ReaderSettings = {
 
 const DEFAULT_BINDING_VIEWER_SETTINGS: Partial<ReaderSettings> = {
     fontFamily: 'Pretendard',
-    fontSize: 10,
+    fontSize: 11,
     lineHeight: 1.55,
 };
 
@@ -540,6 +567,7 @@ function createEmptyCharacter(): StoryCharacter {
         behaviorRules: [],
         customBehaviorRules: '',
         likes: [],
+        customLikes: '',
         dislikes: [],
         customDislikes: '',
         relationship: 'friend',
@@ -558,6 +586,7 @@ function normalizeCharacterForClient(character: Partial<StoryCharacter> = {}): S
         speechStyles: Array.isArray(character.speechStyles) ? character.speechStyles : [],
         behaviorRules: Array.isArray(character.behaviorRules) ? character.behaviorRules : [],
         likes: Array.isArray(character.likes) ? character.likes : [],
+        customLikes: typeof character.customLikes === 'string' ? character.customLikes : '',
         dislikes: Array.isArray(character.dislikes) ? character.dislikes : [],
         goals: Array.isArray(character.goals) ? character.goals : [],
     };
@@ -575,9 +604,16 @@ function normalizePublicMethod(value?: string | null): StoryPublicMethod {
     return 'private';
 }
 
-function resolveStoryVisibilityInfo(story: { isPublic: number; publicStatus?: string | null; publicMethod?: string | null }) {
-    const status = story.publicStatus || (story.isPublic ? 'approved' : 'private');
-    const method = normalizePublicMethod(story.publicMethod);
+function resolveStoryVisibilityInfo(story: {
+    isPublic?: number;
+    is_public?: number | boolean;
+    publicStatus?: string | null;
+    public_status?: string | null;
+    publicMethod?: string | null;
+    public_method?: string | null;
+}) {
+    const status = story.publicStatus || story.public_status || (story.isPublic || story.is_public ? 'approved' : 'private');
+    const method = normalizePublicMethod(story.publicMethod || story.public_method);
 
     if (status === 'pending') {
         return { label: '승인 대기', badge: 'badge-gold' };
@@ -628,6 +664,19 @@ function formatPointAmount(value: number | null | undefined) {
     return `${new Intl.NumberFormat('ko-KR').format(Number(value || 0))}P`;
 }
 
+function normalizePointSettings(value: Partial<PointCostSettings> | Record<string, unknown> | null | undefined): PointCostSettings {
+    const readInt = (current: unknown, fallback: number) => {
+        const parsed = Math.trunc(Number(current));
+        return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+    };
+
+    return {
+        chatPointCost: readInt((value as Record<string, unknown>)?.chatPointCost ?? (value as Record<string, unknown>)?.chat_point_cost, 15),
+        premiumChatPointCost: readInt((value as Record<string, unknown>)?.premiumChatPointCost ?? (value as Record<string, unknown>)?.premium_chat_point_cost, 10),
+        bindingPointCostPerPage: readInt((value as Record<string, unknown>)?.bindingPointCostPerPage ?? (value as Record<string, unknown>)?.binding_point_cost_per_page, 1),
+    };
+}
+
 function formatKoreanDateTime(value: string) {
     const date = new Date(value);
     return Number.isNaN(date.getTime())
@@ -641,8 +690,8 @@ function formatKoreanDateTime(value: string) {
         });
 }
 
-function limitLongText(value: string) {
-    return value.slice(0, LONG_TEXT_LIMIT);
+function limitLongText(value: string, limit: number) {
+    return value.slice(0, limit);
 }
 
 function escapeHtml(value: string) {
@@ -842,13 +891,6 @@ export default function App() {
     const [signupName, setSignupName] = useState('');
     const [signupEmail, setSignupEmail] = useState('');
     const [signupPassword, setSignupPassword] = useState('');
-    const [signupBirthDate, setSignupBirthDate] = useState('');
-    const [signupPhoneNumber, setSignupPhoneNumber] = useState('');
-    const [signupPhoneRequestId, setSignupPhoneRequestId] = useState<number | null>(null);
-    const [signupPhoneCode, setSignupPhoneCode] = useState('');
-    const [signupPhoneToken, setSignupPhoneToken] = useState('');
-    const [signupPhoneSending, setSignupPhoneSending] = useState(false);
-    const [signupPhoneVerifying, setSignupPhoneVerifying] = useState(false);
     const [signupLoading, setSignupLoading] = useState(false);
     const [signupError, setSignupError] = useState('');
     const [signupInfo, setSignupInfo] = useState('');
@@ -865,6 +907,9 @@ export default function App() {
     const [profileAdultVerifying, setProfileAdultVerifying] = useState(false);
     const [profileActionMessage, setProfileActionMessage] = useState('');
     const [adminPointDashboard, setAdminPointDashboard] = useState<AdminPointDashboard | null>(null);
+    const [adminPointSettingsDraft, setAdminPointSettingsDraft] = useState<PointCostSettings>(normalizePointSettings(null));
+    const [adminPointSettingsSaving, setAdminPointSettingsSaving] = useState(false);
+    const [adminPointSettingsError, setAdminPointSettingsError] = useState('');
     const [adminPointLoading, setAdminPointLoading] = useState(false);
     const [adminPointError, setAdminPointError] = useState('');
     const [adminPointUserDetail, setAdminPointUserDetail] = useState<AdminPointUserDetail | null>(null);
@@ -891,6 +936,7 @@ export default function App() {
         cost: number;
     } | null>(null);
     const bindingPrintChargeRunningRef = useRef(false);
+    const bindingPrintPreflightRunningRef = useRef(false);
 
     // Reader Settings (Restored)
     const [readerSettings, setReaderSettings] = useState<ReaderSettings>({ ...DEFAULT_READER_SETTINGS });
@@ -905,6 +951,7 @@ export default function App() {
         title: '', background: '', environment: '', is_public: false, public_method: 'private',
         characters: []
     });
+    const [storyTemplatePickerOpen, setStoryTemplatePickerOpen] = useState(false);
 
     const navigate = (newView: ViewName) => {
         if (newView !== view) {
@@ -936,6 +983,13 @@ export default function App() {
 
         const params = new URLSearchParams(window.location.search);
         const urlToken = params.get('token');
+        const linkSuccess = params.get('linkSuccess');
+        const linkError = params.get('linkError');
+        const oauthLinkMessage = linkSuccess
+            ? 'SNS 연결이 완료되었습니다.'
+            : linkError
+                ? decodeURIComponent(linkError)
+                : '';
         if (urlToken) {
             localStorage.setItem('token', urlToken);
             window.history.replaceState({ view: 'home' }, '', '/');
@@ -947,7 +1001,10 @@ export default function App() {
         fetchMe().then(me => {
             if (me) {
                 setUser({ ...me, point_balance: Number(me.point_balance ?? 0) });
-                setView('home');
+                setView(oauthLinkMessage ? 'profile' : 'home');
+                if (oauthLinkMessage) {
+                    setProfileActionMessage(oauthLinkMessage);
+                }
                 loadStories();
             } else {
                 setUser(null);
@@ -1043,14 +1100,16 @@ export default function App() {
             setPointLoading(true);
             setPointError('');
             const data = await fetchMyPoints();
+            const pointSettings = normalizePointSettings(data.pointSettings || data.point_settings || {});
             const normalized: PointMeData = {
                 pointBalance: Number(data.pointBalance ?? data.point_balance ?? user.point_balance ?? 0),
                 chatCost: Number(data.chatCost ?? data.chat_cost ?? getChatCostForUser(user)),
                 storyLimit: Number(data.storyLimit ?? data.story_limit ?? getStoryLimitForUser(user)),
                 storyCount: Number(data.storyCount ?? data.story_count ?? stories.length),
                 canCharge: Boolean(data.canCharge ?? data.can_charge ?? true),
-                identityVerified: Boolean(data.identityVerified ?? data.identity_verified ?? user.phone_verified_at),
-                adultVerified: Boolean(data.adultVerified ?? data.adult_verified ?? user.is_adult),
+                passVerified: Boolean(data.passVerified ?? data.pass_verified ?? user.pass_verified_at ?? user.phone_verified_at ?? user.adult_verified_at ?? user.is_adult),
+                adultVerified: Boolean(data.adultVerified ?? data.adult_verified ?? user.adult_verified_at ?? user.is_adult ?? user.pass_verified_at ?? user.phone_verified_at),
+                pointSettings,
                 recentTransactions: Array.isArray(data.recentTransactions)
                     ? data.recentTransactions
                     : Array.isArray(data.recent_transactions)
@@ -1144,7 +1203,9 @@ export default function App() {
             setAdminPointLoading(true);
             setAdminPointError('');
             const data = await fetchAdminPointDashboard();
+            const pointSettings = normalizePointSettings(data.pointSettings || data.point_settings || {});
             const normalized: AdminPointDashboard = {
+                pointSettings,
                 summary: {
                     userCount: Number(data.summary?.userCount ?? data.summary?.user_count ?? 0),
                     premiumUserCount: Number(data.summary?.premiumUserCount ?? data.summary?.premium_user_count ?? 0),
@@ -1166,6 +1227,7 @@ export default function App() {
                 topUsers: Array.isArray(data.topUsers) ? data.topUsers : Array.isArray(data.top_users) ? data.top_users : [],
             };
             setAdminPointDashboard(normalized);
+            setAdminPointSettingsDraft(pointSettings);
             return normalized;
         } catch (err: unknown) {
             console.error('Load admin point dashboard failed:', err);
@@ -1261,13 +1323,6 @@ export default function App() {
         setSignupName('');
         setSignupEmail('');
         setSignupPassword('');
-        setSignupBirthDate('');
-        setSignupPhoneNumber('');
-        setSignupPhoneRequestId(null);
-        setSignupPhoneCode('');
-        setSignupPhoneToken('');
-        setSignupPhoneSending(false);
-        setSignupPhoneVerifying(false);
         setSignupLoading(false);
         setSignupError('');
         setSignupInfo('');
@@ -1298,6 +1353,7 @@ export default function App() {
         }
         setActiveStory(null);
         setForm({ title: '', background: '', environment: '', is_public: false, public_method: 'private', cover_image_url: '', characters: [] });
+        setStoryTemplatePickerOpen(false);
         setEditMode('new');
         navigate('studio');
     };
@@ -1317,9 +1373,9 @@ export default function App() {
         const normalizedStory = normalizeStoryForClient(story);
         const publicMethod = normalizePublicMethod(
             normalizedStory.public_method
-                || (normalizedStory.public_status === 'approved' && normalizedStory.is_public ? 'approved' : null)
-                || (normalizedStory.public_status === 'pending' ? 'request' : null)
-                || 'private'
+            || (normalizedStory.public_status === 'approved' && normalizedStory.is_public ? 'approved' : null)
+            || (normalizedStory.public_status === 'pending' ? 'request' : null)
+            || 'private'
         );
         setForm({
             title: normalizedStory.title,
@@ -1331,8 +1387,55 @@ export default function App() {
             characters: normalizedStory.characters || [],
         });
         setActiveStory(normalizedStory);
+        setStoryTemplatePickerOpen(false);
         setEditMode('edit');
         navigate('studio');
+    };
+
+    const cloneCharacterForForm = (character: StoryCharacter): StoryCharacter => ({
+        ...createEmptyCharacter(),
+        name: character.name || '',
+        isProtagonist: Boolean(character.isProtagonist),
+        age: character.age === null || character.age === undefined ? '' : character.age,
+        gender: character.gender || 'other',
+        job: character.job || '',
+        residence: character.residence || '',
+        personality: Array.isArray(character.personality) ? [...character.personality] : [],
+        speechStyles: Array.isArray(character.speechStyles) ? [...character.speechStyles] : [],
+        behaviorRules: Array.isArray(character.behaviorRules) ? [...character.behaviorRules] : [],
+        customBehaviorRules: character.customBehaviorRules || '',
+        likes: Array.isArray(character.likes) ? [...character.likes] : [],
+        customLikes: character.customLikes || '',
+        dislikes: Array.isArray(character.dislikes) ? [...character.dislikes] : [],
+        customDislikes: character.customDislikes || '',
+        relationship: character.relationship || 'friend',
+        goals: Array.isArray(character.goals) ? [...character.goals] : [],
+        customGoals: character.customGoals || '',
+        background: character.background || '',
+    });
+
+    const applyStoryTemplate = (story: Story) => {
+        const normalizedStory = normalizeStoryForClient(story);
+        setActiveStory(null);
+        setForm({
+            title: normalizedStory.title,
+            background: normalizedStory.background,
+            environment: normalizedStory.environment,
+            is_public: false,
+            public_method: 'private',
+            cover_image_url: normalizedStory.cover_image_url || '',
+            characters: (normalizedStory.characters || []).map(cloneCharacterForForm),
+        });
+        setEditMode('new');
+        setStoryTemplatePickerOpen(false);
+        navigate('studio');
+    };
+
+    const openStoryTemplatePicker = async () => {
+        if (!stories.length) {
+            await loadStories();
+        }
+        setStoryTemplatePickerOpen(true);
     };
 
     const saveStory = async () => {
@@ -1344,11 +1447,18 @@ export default function App() {
         }
 
         try {
+            const payload = editMode === 'new'
+                ? {
+                    ...form,
+                    is_public: false,
+                    public_method: 'private' as StoryPublicMethod,
+                }
+                : form;
             if (editMode === 'new') {
-                const res = await createStory(form);
+                const res = await createStory(payload);
                 if (res.error) throw new Error(res.error);
             } else if (activeStory) {
-                const res = await updateStory(activeStory.id, form);
+                const res = await updateStory(activeStory.id, payload);
                 if (res.error) throw new Error(res.error);
             }
             await loadStories();
@@ -1406,7 +1516,8 @@ export default function App() {
         sourceStory: Story | null = activeStory,
         sourceMessages: StoryMessage[] = storyMessages,
         sourceViewerSettings: Partial<ReaderSettings> = readerSettings,
-        sourceRemainingPoints: number = pointData?.pointBalance ?? user?.point_balance ?? 0
+        sourceRemainingPoints: number = pointData?.pointBalance ?? user?.point_balance ?? 0,
+        bindingPointCostPerPage: number = pointData?.pointSettings?.bindingPointCostPerPage ?? 1
     ): BindingSession | null => {
         if (!sourceStory) return null;
 
@@ -1423,6 +1534,7 @@ export default function App() {
             },
             options,
         }) as BindingPage[];
+        const cost = calculateBindingPointCost(pages.length, bindingPointCostPerPage);
 
         return {
             storyId: sourceStory.id,
@@ -1436,26 +1548,61 @@ export default function App() {
             },
             messages,
             pageCount: pages.length,
-            cost: pages.length,
+            cost,
             remainingPoints: sourceRemainingPoints,
             coverImageUrl: sourceStory.cover_image_url || null,
             authorName: user?.name || null,
             createdAt: sourceStory.created_at || null,
             pages,
+            generatedBy: 'client',
         };
     };
 
-    const syncBindingPreview = (nextOptions: BindingOptions) => {
-        const normalizedOptions = normalizeBindingOptions(nextOptions);
-        setBindingOptions(normalizedOptions);
-        const preview = createBindingPreview(normalizedOptions);
-        if (preview) {
-            setBindingPreview(preview);
-        }
-        return preview;
+    const buildBindingSessionFromServerBinding = (
+        bindingData: Record<string, unknown>,
+        fallbackStory: Story,
+        fallbackMessages: StoryMessage[],
+        fallbackOptions: BindingOptions,
+        fallbackRemainingPoints: number,
+        bindingPointCostPerPage: number = pointData?.pointSettings?.bindingPointCostPerPage ?? 1
+    ): BindingSession => {
+        const normalizedMessages = Array.isArray(bindingData.messages) ? bindingData.messages : [...fallbackMessages];
+        const normalizedViewerSettings = {
+            ...DEFAULT_BINDING_VIEWER_SETTINGS,
+            ...(bindingData.viewerSettings || {}),
+        };
+        const pages = Array.isArray(bindingData.pages) && bindingData.pages.length
+            ? (bindingData.pages as BindingPage[])
+            : buildBindingPages({
+                title: String(bindingData.title ?? fallbackStory.title ?? ''),
+                background: String(bindingData.background ?? fallbackStory.background ?? ''),
+                environment: String(bindingData.environment ?? fallbackStory.environment ?? ''),
+                messages: normalizedMessages,
+                viewerSettings: normalizedViewerSettings,
+                options: fallbackOptions,
+            }) as BindingPage[];
+
+        return {
+            storyId: Number(bindingData.storyId ?? fallbackStory.id),
+            title: String(bindingData.title ?? fallbackStory.title ?? ''),
+            background: String(bindingData.background ?? fallbackStory.background ?? ''),
+            environment: String(bindingData.environment ?? fallbackStory.environment ?? ''),
+            options: normalizeBindingOptions(bindingData.options || fallbackOptions),
+            viewerSettings: normalizedViewerSettings,
+            messages: normalizedMessages,
+            pageCount: Number(bindingData.pageCount ?? pages.length ?? 1),
+            cost: Number(bindingData.cost ?? calculateBindingPointCost(pages.length, bindingPointCostPerPage) ?? 1),
+            remainingPoints: Number(bindingData.remainingPoints ?? fallbackRemainingPoints),
+            coverImageUrl: String(bindingData.coverImageUrl ?? fallbackStory.cover_image_url ?? '') || null,
+            authorName: String(bindingData.authorName ?? user?.name ?? '') || null,
+            createdAt: String(bindingData.createdAt ?? fallbackStory.created_at ?? '') || null,
+            pages,
+            generatedBy: 'server',
+            renderChecks: (bindingData.renderChecks as BindingSession['renderChecks']) || undefined,
+        };
     };
 
-    const openBindingQuote = () => {
+    const openBindingQuote = async () => {
         if (!activeStory) {
             alert('이야기를 먼저 열어주세요.');
             return;
@@ -1465,10 +1612,47 @@ export default function App() {
             return;
         }
 
-        const nextPreview = syncBindingPreview(bindingOptions);
-        setBindingOpenError('');
-        setBindingQuoteOpen(true);
-        setBindingPreview(nextPreview ?? createBindingPreview(bindingOptions));
+        try {
+            setBindingOpenError('');
+            setBindingQuoteLoading(true);
+            const result = await prepareStoryBinding(activeStory.id, bindingOptions);
+            const bindingData = result?.binding || {};
+            const nextPreview = buildBindingSessionFromServerBinding(
+                bindingData,
+                activeStory,
+                storyMessages,
+                bindingOptions,
+                pointData?.pointBalance ?? user?.point_balance ?? 0,
+                pointData?.pointSettings?.bindingPointCostPerPage ?? 1
+            );
+            setBindingPreview(nextPreview);
+            setBindingQuoteOpen(true);
+        } catch (err: unknown) {
+            console.error('Open binding quote failed:', err);
+            const message = getErrorMessage(err);
+            if ((err as Error & { code?: string }).code === 'INSUFFICIENT_POINTS') {
+                const fallbackPages = bindingPreview?.pageCount ?? estimateBindingPageCount({
+                    title: activeStory.title || '',
+                    background: activeStory.background || '',
+                    environment: activeStory.environment || '',
+                    messages: storyMessages,
+                    viewerSettings: readerSettings,
+                    options: bindingOptions,
+                });
+                const fallbackNeed = calculateBindingPointCost(
+                    fallbackPages,
+                    pointData?.pointSettings?.bindingPointCostPerPage ?? 1
+                );
+                setInsufficientPointNeed(Number((err as Error & { requiredPoints?: number }).requiredPoints ?? fallbackNeed));
+                setInsufficientPointHave(Number((err as Error & { pointBalance?: number }).pointBalance ?? pointData?.pointBalance ?? user?.point_balance ?? 0));
+                setInsufficientPointMessage('제본을 위한 포인트가 부족합니다 충전하시겠습니까?');
+                setInsufficientPointsOpen(true);
+                return;
+            }
+            setBindingOpenError(message);
+        } finally {
+            setBindingQuoteLoading(false);
+        }
     };
 
     const closeBindingQuote = () => {
@@ -1481,12 +1665,15 @@ export default function App() {
         if (!activeStory || bindingQuoteLoading) return;
 
         const draftPreview = bindingPreview ?? createBindingPreview(bindingOptions);
-        const estimatedPages = draftPreview?.pages?.length ?? draftPreview?.pageCount ?? createBindingPreview(bindingOptions)?.pageCount ?? 1;
+        const estimatedCost = calculateBindingPointCost(
+            draftPreview?.pages?.length ?? draftPreview?.pageCount ?? createBindingPreview(bindingOptions)?.pageCount ?? 1,
+            pointData?.pointSettings?.bindingPointCostPerPage ?? 1
+        );
         const currentBalance = pointData?.pointBalance ?? user?.point_balance ?? 0;
 
-        if (currentBalance < estimatedPages) {
+        if (currentBalance < estimatedCost) {
             setBindingQuoteOpen(false);
-            setInsufficientPointNeed(estimatedPages);
+            setInsufficientPointNeed(estimatedCost);
             setInsufficientPointHave(currentBalance);
             setInsufficientPointMessage('제본을 위한 포인트가 부족합니다 충전하시겠습니까?');
             setInsufficientPointsOpen(true);
@@ -1497,38 +1684,14 @@ export default function App() {
             setBindingQuoteLoading(true);
             const result = await prepareStoryBinding(activeStory.id, bindingOptions);
             const bindingData = result?.binding || {};
-            const normalizedMessages = Array.isArray(bindingData.messages) ? bindingData.messages : [...storyMessages];
-            const fallbackPages = buildBindingPages({
-                title: String(bindingData.title ?? activeStory.title ?? ''),
-                background: String(bindingData.background ?? activeStory.background ?? ''),
-                environment: String(bindingData.environment ?? activeStory.environment ?? ''),
-                messages: normalizedMessages,
-                viewerSettings: {
-                    ...readerSettings,
-                    ...(bindingData.viewerSettings || {}),
-                },
-                options: bindingOptions,
-            }) as BindingPage[];
-            const pages = Array.isArray(bindingData.pages) && bindingData.pages.length ? (bindingData.pages as BindingPage[]) : fallbackPages;
-            const nextPreview: BindingSession = {
-                storyId: Number(bindingData.storyId ?? activeStory.id),
-                title: String(bindingData.title ?? activeStory.title ?? ''),
-                background: String(bindingData.background ?? activeStory.background ?? ''),
-                environment: String(bindingData.environment ?? activeStory.environment ?? ''),
-                options: normalizeBindingOptions(bindingData.options || bindingOptions),
-                viewerSettings: {
-                    ...readerSettings,
-                    ...(bindingData.viewerSettings || {}),
-                },
-                messages: normalizedMessages,
-                pageCount: Number(result?.pageCount ?? bindingData.pageCount ?? pages.length ?? estimatedPages ?? 1),
-                cost: Number(result?.cost ?? bindingData.cost ?? pages.length ?? estimatedPages ?? 1),
-                remainingPoints: Number(result?.remainingPoints ?? currentBalance),
-                coverImageUrl: String(bindingData.coverImageUrl ?? activeStory.cover_image_url ?? '') || null,
-                authorName: String(bindingData.authorName ?? user?.name ?? '') || null,
-                createdAt: String(bindingData.createdAt ?? activeStory.created_at ?? '') || null,
-                pages,
-            };
+            const nextPreview = buildBindingSessionFromServerBinding(
+                bindingData,
+                activeStory,
+                storyMessages,
+                bindingOptions,
+                currentBalance,
+                pointData?.pointSettings?.bindingPointCostPerPage ?? 1
+            );
             setBindingPreview(nextPreview);
             closeBindingQuote();
             navigate('binding');
@@ -1537,8 +1700,8 @@ export default function App() {
             const message = getErrorMessage(err);
             if ((err as Error & { code?: string }).code === 'INSUFFICIENT_POINTS') {
                 setBindingQuoteOpen(false);
-                setInsufficientPointNeed(estimatedPages);
-                setInsufficientPointHave(currentBalance);
+                setInsufficientPointNeed(Number((err as Error & { requiredPoints?: number }).requiredPoints ?? estimatedCost));
+                setInsufficientPointHave(Number((err as Error & { pointBalance?: number }).pointBalance ?? currentBalance));
                 setInsufficientPointMessage('제본을 위한 포인트가 부족합니다 충전하시겠습니까?');
                 setInsufficientPointsOpen(true);
                 return;
@@ -1549,22 +1712,57 @@ export default function App() {
         }
     };
 
-    const handleBindingPrint = () => {
-        if (!bindingPreview || bindingPrintChargeRunningRef.current || bindingPreview.pageCount <= 0) return;
-        bindingPrintChargeRef.current = {
-            storyId: bindingPreview.storyId,
-            options: bindingPreview.options,
-            cost: bindingPreview.cost,
-        };
-        window.print();
+    const handleBindingPrint = async () => {
+        if (!activeStory || bindingPrintChargeRunningRef.current || bindingPrintPreflightRunningRef.current) return;
+
+        try {
+            bindingPrintPreflightRunningRef.current = true;
+            const result = await prepareStoryBinding(activeStory.id, bindingOptions);
+            const bindingData = result?.binding || {};
+            const nextPreview = buildBindingSessionFromServerBinding(
+                bindingData,
+                activeStory,
+                storyMessages,
+                bindingOptions,
+                pointData?.pointBalance ?? user?.point_balance ?? 0,
+                pointData?.pointSettings?.bindingPointCostPerPage ?? 1
+            );
+
+            setBindingPreview(nextPreview);
+            bindingPrintChargeRef.current = {
+                storyId: nextPreview.storyId,
+                options: nextPreview.options,
+                cost: nextPreview.cost,
+            };
+            window.print();
+        } catch (err: unknown) {
+            console.error('Prepare binding print failed:', err);
+            setBindingOpenError(getErrorMessage(err));
+        } finally {
+            bindingPrintPreflightRunningRef.current = false;
+        }
     };
 
     const updateBindingOption = (patch: Partial<BindingOptions>) => {
         const nextOptions = normalizeBindingOptions({ ...bindingOptions, ...patch });
         setBindingOptions(nextOptions);
-        const preview = createBindingPreview(nextOptions);
+        const preview = createBindingPreview(
+            nextOptions,
+            activeStory,
+            bindingPreview?.generatedBy === 'server' ? (bindingPreview.messages || storyMessages) : storyMessages,
+            bindingPreview?.viewerSettings || readerSettings,
+            bindingPreview?.remainingPoints ?? pointData?.pointBalance ?? user?.point_balance ?? 0
+        );
         if (preview) {
-            setBindingPreview(preview);
+            setBindingPreview(
+                bindingPreview?.generatedBy === 'server'
+                    ? {
+                        ...preview,
+                        generatedBy: 'server',
+                        renderChecks: bindingPreview.renderChecks,
+                    }
+                    : preview
+            );
         }
     };
 
@@ -1703,7 +1901,7 @@ export default function App() {
         } catch (err: unknown) {
             const message = getErrorMessage(err);
             setPointError(message);
-            if (/본인인증|PHONE_VERIFICATION_REQUIRED/i.test(message)) {
+            if (/PASS|본인인증|PHONE_VERIFICATION_REQUIRED/i.test(message)) {
                 navigate('profile');
             }
             throw err;
@@ -1731,56 +1929,14 @@ export default function App() {
         }
     };
 
-    const handleSignupRequestCode = async () => {
-        const phoneNumber = signupPhoneNumber.trim();
-        if (!phoneNumber) {
-            setSignupError('휴대폰 번호를 입력해주세요.');
-            return;
-        }
-        try {
-            setSignupPhoneSending(true);
-            setSignupError('');
-            const result = await requestPhoneVerification({ phoneNumber, purpose: 'signup' });
-            setSignupPhoneRequestId(Number(result.verificationId));
-            setSignupInfo(result.debugCode ? `개발용 인증번호: ${result.debugCode}` : '인증번호를 전송했습니다.');
-        } catch (err: unknown) {
-            setSignupError(getErrorMessage(err));
-        } finally {
-            setSignupPhoneSending(false);
-        }
-    };
-
-    const handleSignupVerifyCode = async () => {
-        if (!signupPhoneRequestId) {
-            setSignupError('먼저 인증번호를 요청해주세요.');
-            return;
-        }
-        const code = signupPhoneCode.trim();
-        if (!code) {
-            setSignupError('인증번호를 입력해주세요.');
-            return;
-        }
-
-        try {
-            setSignupPhoneVerifying(true);
-            setSignupError('');
-            const result = await verifyPhoneCode({ verificationId: signupPhoneRequestId, code });
-            setSignupPhoneToken(result.verificationToken);
-            setSignupInfo('휴대폰 인증이 완료되었습니다.');
-        } catch (err: unknown) {
-            setSignupError(getErrorMessage(err));
-        } finally {
-            setSignupPhoneVerifying(false);
-        }
-    };
-
     const handleSignupSubmit = async () => {
-        if (!signupPhoneToken) {
-            setSignupError('휴대폰 인증을 먼저 완료해주세요.');
-            return;
-        }
         if (!signupName.trim() || !signupEmail.trim() || !signupPassword) {
             setSignupError('이름, 이메일, 비밀번호를 모두 입력해주세요.');
+            return;
+        }
+        const email = signupEmail.trim();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+            setSignupError('이메일 형식이 올바르지 않습니다.');
             return;
         }
 
@@ -1789,17 +1945,12 @@ export default function App() {
             setSignupError('');
             const result = await registerLocalUser({
                 name: signupName.trim(),
-                email: signupEmail.trim(),
+                email,
                 password: signupPassword,
-                birthDate: signupBirthDate || undefined,
-                phoneVerificationToken: signupPhoneToken,
             });
             await applyAuthenticatedSession(result);
             setSignupInfo('회원가입이 완료되었습니다. 환영 포인트가 지급됐습니다.');
             setSignupPassword('');
-            setSignupPhoneCode('');
-            setSignupPhoneToken('');
-            setSignupPhoneRequestId(null);
         } catch (err: unknown) {
             setSignupError(getErrorMessage(err));
         } finally {
@@ -1811,17 +1962,17 @@ export default function App() {
         if (!user) return;
         const phoneNumber = profilePhoneNumber.trim() || user.phone_number || '';
         if (!phoneNumber) {
-            setProfileActionMessage('휴대폰 번호를 입력해주세요.');
+            setProfileActionMessage('PASS 인증용 휴대폰 번호를 입력해주세요.');
             return;
         }
 
         try {
             setProfilePhoneSending(true);
             setProfileActionMessage('');
-            const result = await requestPhoneVerification({ phoneNumber, purpose: 'identity', createdForUserId: user.id });
+            const result = await requestPassVerification({ phoneNumber, purpose: 'identity', createdForUserId: user.id });
             setProfilePhoneRequestId(Number(result.verificationId));
             setProfilePhoneNumber(phoneNumber);
-            setProfileActionMessage(result.debugCode ? `개발용 인증번호: ${result.debugCode}` : '인증번호를 전송했습니다.');
+            setProfileActionMessage(result.debugCode ? `개발용 PASS 인증번호: ${result.debugCode}` : 'PASS 인증번호를 전송했습니다.');
         } catch (err: unknown) {
             setProfileActionMessage(getErrorMessage(err));
         } finally {
@@ -1838,8 +1989,8 @@ export default function App() {
         try {
             setProfilePhoneVerifying(true);
             setProfileActionMessage('');
-            const verifyResult = await verifyPhoneCode({ verificationId: profilePhoneRequestId, code: profilePhoneCode.trim() });
-            const completeResult = await completePhoneVerification({ verificationToken: verifyResult.verificationToken });
+            const verifyResult = await verifyPassCode({ verificationId: profilePhoneRequestId, code: profilePhoneCode.trim() });
+            const completeResult = await completePassVerification({ verificationToken: verifyResult.verificationToken });
             if (completeResult?.user) {
                 setUser((current) => current ? { ...current, ...(completeResult.user as AuthUser) } : current);
             } else {
@@ -1851,11 +2002,14 @@ export default function App() {
             setPointData((current) => current ? {
                 ...current,
                 canCharge: true,
-                identityVerified: true,
+                passVerified: true,
+                adultVerified: true,
             } : current);
-            setProfileActionMessage('본인인증이 완료되었습니다.');
+            setProfileActionMessage('PASS 인증이 완료되어 충전과 성인인증이 함께 활성화되었습니다.');
             setProfilePhoneCode('');
             setProfilePhoneRequestId(null);
+            setProfileAdultRequestId(null);
+            setProfileAdultCode('');
         } catch (err: unknown) {
             setProfileActionMessage(getErrorMessage(err));
         } finally {
@@ -1867,7 +2021,7 @@ export default function App() {
         if (!user) return;
         const phoneNumber = profileAdultPhoneNumber.trim() || user.phone_number || '';
         if (!phoneNumber) {
-            setProfileActionMessage('성인인증용 휴대폰 번호를 입력해주세요.');
+            setProfileActionMessage('PASS 성인인증용 휴대폰 번호를 입력해주세요.');
             return;
         }
         if (!profileAdultBirthDate.trim()) {
@@ -1878,10 +2032,10 @@ export default function App() {
         try {
             setProfileAdultSending(true);
             setProfileActionMessage('');
-            const result = await requestPhoneVerification({ phoneNumber, purpose: 'adult', createdForUserId: user.id });
+            const result = await requestPassVerification({ phoneNumber, purpose: 'adult', createdForUserId: user.id });
             setProfileAdultRequestId(Number(result.verificationId));
             setProfileAdultPhoneNumber(phoneNumber);
-            setProfileActionMessage(result.debugCode ? `개발용 인증번호: ${result.debugCode}` : '성인인증 인증번호를 전송했습니다.');
+            setProfileActionMessage(result.debugCode ? `개발용 PASS 인증번호: ${result.debugCode}` : 'PASS 성인인증 인증번호를 전송했습니다.');
         } catch (err: unknown) {
             setProfileActionMessage(getErrorMessage(err));
         } finally {
@@ -1898,7 +2052,7 @@ export default function App() {
         try {
             setProfileAdultVerifying(true);
             setProfileActionMessage('');
-            const verifyResult = await verifyPhoneCode({ verificationId: profileAdultRequestId, code: profileAdultCode.trim() });
+            const verifyResult = await verifyPassCode({ verificationId: profileAdultRequestId, code: profileAdultCode.trim() });
             const completeResult = await completeAdultVerification({
                 verificationToken: verifyResult.verificationToken,
                 birthDate: profileAdultBirthDate,
@@ -1913,15 +2067,34 @@ export default function App() {
             }
             setPointData((current) => current ? {
                 ...current,
+                passVerified: true,
                 adultVerified: true,
             } : current);
-            setProfileActionMessage('성인인증이 완료되었습니다.');
+            setProfileActionMessage('PASS 인증이 완료되어 충전과 성인인증이 함께 활성화되었습니다.');
             setProfileAdultCode('');
             setProfileAdultRequestId(null);
+            setProfilePhoneRequestId(null);
+            setProfilePhoneCode('');
         } catch (err: unknown) {
             setProfileActionMessage(getErrorMessage(err));
         } finally {
             setProfileAdultVerifying(false);
+        }
+    };
+
+    const handleOauthConnect = async (provider: 'kakao' | 'google' | 'naver') => {
+        if (!user) return;
+        if (user.provider !== 'local') {
+            setProfileActionMessage('일반 계정에서만 SNS 연결이 가능합니다.');
+            return;
+        }
+
+        try {
+            setProfileActionMessage('');
+            const result = await startOauthLink({ provider });
+            window.location.href = String((result as { url?: string }).url || '');
+        } catch (err: unknown) {
+            setProfileActionMessage(getErrorMessage(err));
         }
     };
 
@@ -2265,6 +2438,24 @@ export default function App() {
         }
     };
 
+    const handleAdminPointSettingsSave = async () => {
+        try {
+            setAdminPointSettingsSaving(true);
+            setAdminPointSettingsError('');
+            const nextSettings = normalizePointSettings(adminPointSettingsDraft);
+            const result = await updateAdminPointSettings({ pointSettings: nextSettings });
+            const savedSettings = normalizePointSettings(result?.pointSettings || nextSettings);
+            setAdminPointSettingsDraft(savedSettings);
+            await loadAdminPointDashboard().catch(() => undefined);
+            await loadPointData().catch(() => undefined);
+        } catch (err: unknown) {
+            console.error('Save admin point settings failed:', err);
+            setAdminPointSettingsError(getErrorMessage(err));
+        } finally {
+            setAdminPointSettingsSaving(false);
+        }
+    };
+
     // ── Render helpers ───────────────────────────────────────
     const renderNav = () => (
         <nav className="top-nav">
@@ -2313,13 +2504,13 @@ export default function App() {
             <div className="login-shell">
                 <div className="glass-panel login-hero">
                     <BookOpen size={48} className="text-accent" style={{ marginBottom: '1rem' }} />
-                    <span className="badge badge-gold">정식 회원가입 · SMS 인증 · 포인트 충전</span>
+                    <span className="badge badge-gold">정식 회원가입 · PASS 본인확인 · 포인트 충전</span>
                     <h1 className="title-font" style={{ fontSize: '2rem', margin: '1rem 0 0.75rem' }}>
                         Novel<span className="text-accent">AI</span>
                     </h1>
                     <p className="text-muted" style={{ lineHeight: 1.7, maxWidth: 520 }}>
-                        SNS 로그인은 그대로 두고, 이메일 회원가입과 휴대폰 인증을 추가했습니다.
-                        포인트 충전은 본인인증 후에만 가능하고, 마이페이지에서 성인인증도 진행할 수 있습니다.
+                        당신의 꿈을 펼쳐보세요
+                        BanaNovel에서 당신의 상상력을 실현시켜드립니다.
                     </p>
 
                     <div className="login-feature-grid">
@@ -2330,13 +2521,13 @@ export default function App() {
                         </div>
                         <div className="glass-panel login-feature-card">
                             <WalletCards size={20} className="text-accent" />
-                            <strong>본인인증 후 충전</strong>
-                            <p className="text-muted">문자 인증을 통과해야 포인트 충전이 열립니다.</p>
+                            <strong>PASS 인증 후 충전</strong>
+                            <p className="text-muted">한 번 PASS 인증을 완료하면 포인트 충전과 성인인증이 함께 열립니다.</p>
                         </div>
                         <div className="glass-panel login-feature-card">
                             <ShieldAlert size={20} className="text-accent" />
                             <strong>성인인증</strong>
-                            <p className="text-muted">마이페이지에서 성인 인증 플래그를 설정할 수 있습니다.</p>
+                            <p className="text-muted">마이페이지에서 PASS 인증을 한 번만 진행하면 자동으로 활성화됩니다.</p>
                         </div>
                     </div>
                 </div>
@@ -2381,37 +2572,12 @@ export default function App() {
                                 <label>비밀번호</label>
                                 <input className="input-control" type="password" value={signupPassword} onChange={(e) => setSignupPassword(e.target.value)} placeholder="최소 8자" />
                             </div>
-                            <div className="input-group">
-                                <label>생년월일</label>
-                                <input className="input-control" type="date" value={signupBirthDate} onChange={(e) => setSignupBirthDate(e.target.value)} />
-                                <p className="input-help">선택 입력입니다. 마이페이지에서 성인인증을 다시 할 수 있습니다.</p>
-                            </div>
-                            <div className="input-group">
-                                <label>휴대폰 번호</label>
-                                <input className="input-control" value={signupPhoneNumber} onChange={(e) => setSignupPhoneNumber(e.target.value)} placeholder="01012345678" />
-                            </div>
-                            <div className="inline-actions">
-                                <button className="btn btn-outline" type="button" onClick={() => void handleSignupRequestCode()} disabled={signupPhoneSending}>
-                                    {signupPhoneSending ? '전송 중...' : '인증번호 받기'}
-                                </button>
-                                <span className="text-muted" style={{ fontSize: '0.85rem' }}>{signupPhoneRequestId ? '인증번호가 발송됐습니다.' : '먼저 휴대폰 번호를 입력하세요.'}</span>
-                            </div>
-                            <div className="input-group">
-                                <label>인증번호</label>
-                                <input className="input-control" inputMode="numeric" value={signupPhoneCode} onChange={(e) => setSignupPhoneCode(e.target.value)} placeholder="6자리 숫자" />
-                            </div>
-                            <div className="inline-actions">
-                                <button className="btn btn-outline" type="button" onClick={() => void handleSignupVerifyCode()} disabled={signupPhoneVerifying || !signupPhoneRequestId}>
-                                    {signupPhoneVerifying ? '확인 중...' : '번호 확인'}
-                                </button>
-                                <span className="text-muted" style={{ fontSize: '0.85rem' }}>{signupPhoneToken ? '휴대폰 인증 완료' : '인증번호 확인 후 가입할 수 있어요.'}</span>
-                            </div>
                             {signupInfo && <p className="text-muted">{signupInfo}</p>}
                             {signupError && <p className="text-negative">{signupError}</p>}
-                            <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleSignupSubmit()} disabled={signupLoading || !signupPhoneToken}>
+                            <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleSignupSubmit()} disabled={signupLoading}>
                                 {signupLoading ? '가입 중...' : '회원가입하기'}
                             </button>
-                            <p className="input-help">가입 즉시 웰컴 포인트 50P가 지급됩니다.</p>
+                            <p className="input-help">가입 즉시 웰컴 포인트 50P가 지급됩니다. 가입 후 PASS 인증으로 충전과 성인인증을 진행할 수 있습니다.</p>
                         </div>
                     )}
 
@@ -2796,7 +2962,7 @@ export default function App() {
         const chatCost = pointData?.chatCost ?? getChatCostForUser(user);
         const storyLimit = pointData?.storyLimit ?? getStoryLimitForUser(user);
         const storyCount = pointData?.storyCount ?? stories.length;
-        const canCharge = Boolean(pointData?.canCharge ?? user?.phone_verified_at ?? user?.role === 'admin');
+        const canCharge = Boolean(pointData?.canCharge ?? user?.pass_verified_at ?? user?.phone_verified_at ?? user?.adult_verified_at ?? user?.is_adult ?? user?.role === 'admin');
         const quickPackages = [100, 300, 500, 1000] as const;
         const transactions = pointData?.recentTransactions || [];
         return (
@@ -2848,9 +3014,9 @@ export default function App() {
 
                 {!canCharge && (
                     <div className="glass-panel" style={{ marginBottom: '1rem', borderColor: 'rgba(244, 180, 0, 0.35)', background: 'rgba(244, 180, 0, 0.06)' }}>
-                        <strong>본인인증이 필요합니다</strong>
+                        <strong>PASS 인증이 필요합니다</strong>
                         <p className="text-muted" style={{ marginTop: '0.35rem' }}>
-                            포인트 충전은 휴대폰 본인인증 후에만 가능합니다. 마이페이지에서 인증을 먼저 완료해주세요.
+                            포인트 충전은 PASS 인증 후에만 가능합니다. 마이페이지에서 인증을 먼저 완료해주세요.
                         </p>
                         <button className="btn btn-outline" style={{ marginTop: '0.9rem' }} onClick={() => navigate('profile')}>
                             마이페이지로 이동
@@ -2970,30 +3136,42 @@ export default function App() {
             );
         }
 
-        const preview = bindingPreview;
-        const bindingMessages = storyMessages.length ? storyMessages : (preview?.messages || storyMessages);
-        const bindingViewerSettings = DEFAULT_BINDING_VIEWER_SETTINGS;
+        const preview = bindingPreview ?? createBindingPreview(
+            bindingOptions,
+            activeStory,
+            storyMessages,
+            DEFAULT_BINDING_VIEWER_SETTINGS,
+            pointData?.pointBalance ?? user?.point_balance ?? 0
+        );
+        const bindingMessages = preview?.messages || storyMessages;
+        const bindingViewerSettings = {
+            ...DEFAULT_BINDING_VIEWER_SETTINGS,
+            ...(preview?.viewerSettings || {}),
+        };
         const bindingFontSize = bindingViewerSettings.fontSize || DEFAULT_BINDING_VIEWER_SETTINGS.fontSize || readerSettings.fontSize;
         const bindingLineHeight = bindingViewerSettings.lineHeight || DEFAULT_BINDING_VIEWER_SETTINGS.lineHeight || readerSettings.lineHeight;
         const bindingFontFamily = bindingViewerSettings.fontFamily || DEFAULT_BINDING_VIEWER_SETTINGS.fontFamily || readerSettings.fontFamily;
         const bindingPreviewOptions = preview?.options || bindingOptions;
-        const bindingPages: BindingPage[] = buildBindingPages({
+        const bindingPointCostPerPage = pointData?.pointSettings?.bindingPointCostPerPage ?? 1;
+        const bindingPages: BindingPage[] = preview?.pages?.length
+            ? preview.pages
+            : buildBindingPages({
+                title: preview?.title || activeStory?.title || '',
+                background: preview?.background || activeStory?.background || '',
+                environment: preview?.environment || activeStory?.environment || '',
+                messages: bindingMessages,
+                viewerSettings: bindingViewerSettings,
+                options: bindingPreviewOptions,
+            }) as BindingPage[];
+        const bindingPageCount = preview?.pageCount ?? (bindingPages.length || estimateBindingPageCount({
             title: preview?.title || activeStory?.title || '',
             background: preview?.background || activeStory?.background || '',
             environment: preview?.environment || activeStory?.environment || '',
             messages: bindingMessages,
             viewerSettings: bindingViewerSettings,
             options: bindingPreviewOptions,
-        }) as BindingPage[];
-        const bindingPageCount = bindingPages.length || estimateBindingPageCount({
-            title: preview?.title || activeStory?.title || '',
-            background: preview?.background || activeStory?.background || '',
-            environment: preview?.environment || activeStory?.environment || '',
-            messages: bindingMessages,
-            viewerSettings: bindingViewerSettings,
-            options: bindingPreviewOptions,
-        });
-        const bindingCost = preview?.cost || bindingPageCount;
+        }));
+        const bindingCost = calculateBindingPointCost(bindingPageCount, bindingPointCostPerPage);
         const remainingPoints = preview?.remainingPoints ?? (pointData?.pointBalance ?? user?.point_balance ?? 0);
         const bindingFixedTypeSpec = `${bindingFontFamily} · ${bindingFontSize.toFixed(0)}px`;
 
@@ -3131,7 +3309,7 @@ export default function App() {
                 <div className="glass-panel binding-toolbar">
                     <div className="binding-toolbar-copy">
                         <div className="admin-hero-title">
-                        <ScrollText size={22} className="text-accent" />
+                            <ScrollText size={22} className="text-accent" />
                             <h1 className="title-font" style={{ fontSize: '1.6rem' }}>A5 제본 미리보기</h1>
                         </div>
                         <p className="text-muted" style={{ marginTop: '0.4rem', lineHeight: 1.6 }}>
@@ -3148,7 +3326,7 @@ export default function App() {
                         <button className="btn btn-outline" onClick={() => navigate('chat')}>
                             <ChevronLeft size={16} /> 읽기 화면
                         </button>
-                        <button className="btn btn-primary" onClick={handleBindingPrint} disabled={bindingMessages.length === 0 || bindingPageCount === 0}>
+                        <button className="btn btn-primary" onClick={() => void handleBindingPrint()} disabled={bindingMessages.length === 0 || bindingPageCount === 0 || bindingPrintPreflightRunningRef.current || bindingPrintChargeRunningRef.current}>
                             <ScrollText size={16} /> 제본하기
                         </button>
                     </div>
@@ -3196,7 +3374,7 @@ export default function App() {
                                 </div>
                             </div>
                             <p className="text-muted" style={{ marginTop: '0.9rem', lineHeight: 1.6 }}>
-                                제본 차감은 선택한 표지, 작가의 말, 본문을 모두 합한 총 페이지당 1포인트로 처리됩니다. 인쇄 전에는 내용을 다시 확인해 주세요.
+                                제본 차감은 선택한 표지, 작가의 말, AI가 생성한 본문을 모두 합한 총 페이지당 {formatPointAmount(bindingPointCostPerPage)}로 처리됩니다. 인쇄 전에는 내용을 다시 확인해 주세요.
                             </p>
                         </div>
 
@@ -3223,7 +3401,7 @@ export default function App() {
                         <Users size={48} className="text-accent" style={{ margin: '0 auto 1rem' }} />
                         <h1 className="title-font" style={{ fontSize: '1.6rem', marginBottom: '0.5rem' }}>로그인이 필요합니다</h1>
                         <p className="text-muted" style={{ lineHeight: 1.7 }}>
-                            마이페이지에서는 본인인증과 성인인증을 진행할 수 있습니다.
+                            마이페이지에서는 PASS 인증과 성인인증을 진행할 수 있습니다.
                         </p>
                         <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '1.5rem' }} onClick={() => navigate('login')}>
                             로그인하기
@@ -3233,8 +3411,9 @@ export default function App() {
             );
         }
 
-        const identityVerified = Boolean(pointData?.identityVerified ?? user.phone_verified_at);
-        const adultVerified = Boolean(pointData?.adultVerified ?? user.is_adult);
+        const passVerified = Boolean(pointData?.passVerified ?? user.pass_verified_at ?? user.phone_verified_at ?? user.adult_verified_at ?? user.is_adult);
+        const adultVerified = Boolean(pointData?.adultVerified ?? user.adult_verified_at ?? user.is_adult ?? passVerified ?? user.phone_verified_at);
+        const linkedProviders = Array.isArray(user.linked_providers) ? user.linked_providers : [];
 
         return (
             <div className="main-content fade-in">
@@ -3245,7 +3424,7 @@ export default function App() {
                             <h1 className="title-font" style={{ fontSize: '1.6rem' }}>마이페이지</h1>
                         </div>
                         <p className="text-muted" style={{ marginTop: '0.5rem' }}>
-                            계정 정보, 본인인증, 성인인증 상태를 한 곳에서 관리하세요.
+                            계정 정보와 PASS 인증 상태를 한 곳에서 관리하세요. 한 번만 인증하면 충전과 성인인증이 함께 열립니다.
                         </p>
                     </div>
                     <div className="admin-hero-actions">
@@ -3273,8 +3452,17 @@ export default function App() {
                         <div className="profile-badge-row">
                             <span className={`badge ${user.role === 'admin' ? 'badge-red' : 'badge-green'}`}>{user.role}</span>
                             <span className="badge badge-green">{user.provider || 'local'}</span>
-                            <span className={`badge ${identityVerified ? 'badge-green' : 'badge-red'}`}>{identityVerified ? '본인인증 완료' : '본인인증 필요'}</span>
+                            <span className={`badge ${passVerified ? 'badge-green' : 'badge-red'}`}>{passVerified ? 'PASS 인증 완료' : 'PASS 인증 필요'}</span>
                             <span className={`badge ${adultVerified ? 'badge-green' : 'badge-red'}`}>{adultVerified ? '성인인증 완료' : '성인인증 필요'}</span>
+                        </div>
+                        <div className="profile-badge-row" style={{ marginTop: '0.75rem' }}>
+                            {linkedProviders.length ? (
+                                linkedProviders.map((providerName) => (
+                                    <span key={providerName} className="badge badge-blue">{providerName} 연결됨</span>
+                                ))
+                            ) : (
+                                <span className="text-muted" style={{ fontSize: '0.9rem' }}>연결된 SNS 없음</span>
+                            )}
                         </div>
                         <div className="profile-meta-list">
                             <div><span>휴대폰</span><strong>{user.phone_number || '미등록'}</strong></div>
@@ -3285,9 +3473,63 @@ export default function App() {
                     </div>
 
                     <div className="glass-panel profile-summary-card">
-                        <span className="badge badge-green">본인인증</span>
+                        <span className="badge badge-blue">SNS 연결</span>
+                        <h3 className="section-title" style={{ marginTop: '0.75rem' }}>일반 계정에 SNS 추가</h3>
+                        <p className="text-muted">카카오, 네이버, 구글을 연결하면 다음부터 같은 계정으로 바로 로그인할 수 있습니다.</p>
+                        {user.provider === 'local' ? (
+                            <div style={{ display: 'grid', gap: '0.7rem', marginTop: '1rem' }}>
+                                {(() => {
+                                    const kakaoLinked = linkedProviders.includes('kakao');
+                                    return (
+                                <button
+                                    className="btn"
+                                    type="button"
+                                    onClick={() => void handleOauthConnect('kakao')}
+                                    disabled={kakaoLinked}
+                                    style={{ background: '#FEE500', color: '#3C1E1E', justifyContent: 'center', fontWeight: 600, opacity: kakaoLinked ? 0.65 : 1 }}
+                                >
+                                    {kakaoLinked ? '카카오 연결됨' : '카카오 연결'}
+                                </button>
+                                    );
+                                })()}
+                                {(() => {
+                                    const naverLinked = linkedProviders.includes('naver');
+                                    return (
+                                <button
+                                    className="btn"
+                                    type="button"
+                                    onClick={() => void handleOauthConnect('naver')}
+                                    disabled={naverLinked}
+                                    style={{ background: '#03C75A', color: 'white', justifyContent: 'center', fontWeight: 600, opacity: naverLinked ? 0.65 : 1 }}
+                                >
+                                    {naverLinked ? '네이버 연결됨' : '네이버 연결'}
+                                </button>
+                                    );
+                                })()}
+                                {(() => {
+                                    const googleLinked = linkedProviders.includes('google');
+                                    return (
+                                <button
+                                    className="btn"
+                                    type="button"
+                                    onClick={() => void handleOauthConnect('google')}
+                                    disabled={googleLinked}
+                                    style={{ background: 'white', color: '#333', justifyContent: 'center', fontWeight: 600, border: '1px solid #ddd', opacity: googleLinked ? 0.65 : 1 }}
+                                >
+                                    {googleLinked ? '구글 연결됨' : '구글 연결'}
+                                </button>
+                                    );
+                                })()}
+                            </div>
+                        ) : (
+                            <p className="text-muted" style={{ marginTop: '1rem' }}>SNS 계정으로 로그인한 상태에서는 추가 연결을 지원하지 않습니다.</p>
+                        )}
+                    </div>
+
+                    <div className="glass-panel profile-summary-card">
+                        <span className="badge badge-green">PASS 본인확인</span>
                         <h3 className="section-title" style={{ marginTop: '0.75rem' }}>포인트 충전 전 확인</h3>
-                        <p className="text-muted">휴대폰 인증을 해야 포인트 충전이 열립니다.</p>
+                        <p className="text-muted">PASS 인증을 한 번 하면 포인트 충전과 성인인증이 함께 열립니다.</p>
 
                         <div className="input-group">
                             <label>휴대폰 번호</label>
@@ -3296,16 +3538,16 @@ export default function App() {
                                 value={profilePhoneNumber}
                                 onChange={(e) => setProfilePhoneNumber(e.target.value)}
                                 placeholder={user.phone_number || '01012345678'}
-                                disabled={identityVerified}
+                                disabled={passVerified}
                             />
                         </div>
 
                         <div className="inline-actions">
-                            <button className="btn btn-outline" type="button" onClick={() => void handleProfilePhoneRequest()} disabled={profilePhoneSending || identityVerified}>
-                                {profilePhoneSending ? '전송 중...' : identityVerified ? '완료됨' : '인증번호 받기'}
+                            <button className="btn btn-outline" type="button" onClick={() => void handleProfilePhoneRequest()} disabled={profilePhoneSending || passVerified}>
+                                {profilePhoneSending ? '전송 중...' : passVerified ? '완료됨' : 'PASS 인증하기'}
                             </button>
                             <span className="text-muted" style={{ fontSize: '0.85rem' }}>
-                                {identityVerified ? '이미 본인인증이 완료되었습니다.' : '문자 인증 후 포인트 충전이 가능합니다.'}
+                                {passVerified ? '이미 PASS 인증이 완료되었습니다.' : 'PASS 인증 후 포인트 충전이 가능합니다.'}
                             </span>
                         </div>
 
@@ -3316,19 +3558,19 @@ export default function App() {
                                 value={profilePhoneCode}
                                 onChange={(e) => setProfilePhoneCode(e.target.value)}
                                 placeholder="6자리 숫자"
-                                disabled={identityVerified}
+                                disabled={passVerified}
                             />
                         </div>
 
-                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleProfilePhoneVerify()} disabled={profilePhoneVerifying || identityVerified || !profilePhoneRequestId}>
-                            {profilePhoneVerifying ? '확인 중...' : identityVerified ? '본인인증 완료' : '번호 확인'}
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleProfilePhoneVerify()} disabled={profilePhoneVerifying || passVerified || !profilePhoneRequestId}>
+                            {profilePhoneVerifying ? '확인 중...' : passVerified ? 'PASS 인증 완료' : 'PASS 확인'}
                         </button>
                     </div>
 
                     <div className="glass-panel profile-summary-card">
                         <span className="badge badge-gold">성인인증</span>
                         <h3 className="section-title" style={{ marginTop: '0.75rem' }}>마이페이지에서 설정</h3>
-                        <p className="text-muted">성인 여부는 생년월일과 휴대폰 인증을 함께 확인합니다.</p>
+                        <p className="text-muted">PASS 인증을 한 번 하면 성인인증과 포인트 충전이 함께 활성화됩니다.</p>
 
                         <div className="input-group">
                             <label>생년월일</label>
@@ -3354,10 +3596,10 @@ export default function App() {
 
                         <div className="inline-actions">
                             <button className="btn btn-outline" type="button" onClick={() => void handleProfileAdultRequest()} disabled={profileAdultSending || adultVerified}>
-                                {profileAdultSending ? '전송 중...' : adultVerified ? '완료됨' : '성인인증번호 받기'}
+                                {profileAdultSending ? '전송 중...' : adultVerified ? '완료됨' : 'PASS 인증하기'}
                             </button>
                             <span className="text-muted" style={{ fontSize: '0.85rem' }}>
-                                {adultVerified ? '성인인증이 완료되었습니다.' : '인증 후 성인 콘텐츠 공개 플래그가 활성화됩니다.'}
+                                {adultVerified ? '성인인증이 완료되었습니다.' : 'PASS 인증 후 성인 콘텐츠 공개 플래그가 활성화됩니다.'}
                             </span>
                         </div>
 
@@ -3373,7 +3615,7 @@ export default function App() {
                         </div>
 
                         <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleProfileAdultVerify()} disabled={profileAdultVerifying || adultVerified || !profileAdultRequestId}>
-                            {profileAdultVerifying ? '확인 중...' : adultVerified ? '성인인증 완료' : '성인 인증 완료'}
+                            {profileAdultVerifying ? '확인 중...' : adultVerified ? '성인인증 완료' : 'PASS 성인인증'}
                         </button>
                     </div>
                 </div>
@@ -3401,16 +3643,27 @@ export default function App() {
         }
 
         type CharacterMultiField = 'personality' | 'speechStyles' | 'behaviorRules' | 'likes' | 'dislikes' | 'goals';
-        type CharacterTextField = 'customBehaviorRules' | 'customDislikes' | 'customGoals' | 'background';
+        type CharacterTextField = 'customBehaviorRules' | 'customLikes' | 'customDislikes' | 'customGoals' | 'background';
+        const characterTextLimits: Record<CharacterTextField, number> = {
+            customBehaviorRules: CHARACTER_BEHAVIOR_LIMIT,
+            customLikes: CHARACTER_LIKE_MEMO_LIMIT,
+            customDislikes: CHARACTER_DISLIKE_LIMIT,
+            customGoals: CHARACTER_LIKE_MEMO_LIMIT,
+            background: CHARACTER_BACKGROUND_LIMIT,
+        };
 
         const handleAddCharacter = () => {
             if (form.characters && form.characters.length >= MAX_CHARACTERS) {
                 alert(`등장인물은 최대 ${MAX_CHARACTERS}명까지만 가능합니다.`);
                 return;
             }
+            const isFirstCharacter = (form.characters || []).length === 0;
             setForm(prev => ({
                 ...prev,
-                characters: [...(prev.characters || []), createEmptyCharacter()]
+                characters: [...(prev.characters || []), {
+                    ...createEmptyCharacter(),
+                    isProtagonist: editMode === 'new' && isFirstCharacter,
+                }]
             }));
         };
 
@@ -3462,7 +3715,7 @@ export default function App() {
         };
 
         const handleLongTextChange = (index: number, field: CharacterTextField, value: string) => {
-            handleCharChange(index, field, limitLongText(value) as StoryCharacter[typeof field]);
+            handleCharChange(index, field, limitLongText(value, characterTextLimits[field]) as StoryCharacter[typeof field]);
         };
 
         const renderChoiceGroup = (
@@ -3480,15 +3733,15 @@ export default function App() {
                         const checked = selectedValues.includes(option.value);
 
                         return (
-                            <label key={option.value} className={`choice-chip ${checked ? 'is-selected' : ''}`}>
-                                <input
-                                    type="checkbox"
-                                    value={option.value}
-                                    checked={checked}
-                                    onChange={() => toggleCharacterSelection(characterIndex, field, option.value, maxSelections, limitLabel)}
-                                />
+                            <button
+                                key={option.value}
+                                type="button"
+                                className={`choice-chip ${checked ? 'is-selected' : ''}`}
+                                aria-pressed={checked}
+                                onClick={() => toggleCharacterSelection(characterIndex, field, option.value, maxSelections, limitLabel)}
+                            >
                                 <span>{option.label}</span>
-                            </label>
+                            </button>
                         );
                     })}
                 </div>
@@ -3505,26 +3758,25 @@ export default function App() {
             return (
                 <div className="selection-grid">
                     {options.map((option) => (
-                        <label key={option.value} className={`choice-chip ${selectedValue === option.value ? 'is-selected' : ''}`}>
-                            <input
-                                type="radio"
-                                name={`${field}-${characterIndex}`}
-                                value={option.value}
-                                checked={selectedValue === option.value}
-                                onChange={() => handleCharChange(characterIndex, field, option.value as StoryCharacter[typeof field])}
-                            />
+                        <button
+                            key={option.value}
+                            type="button"
+                            className={`choice-chip ${selectedValue === option.value ? 'is-selected' : ''}`}
+                            aria-pressed={selectedValue === option.value}
+                            onClick={() => handleCharChange(characterIndex, field, option.value as StoryCharacter[typeof field])}
+                        >
                             <span>{option.label}</span>
-                        </label>
+                        </button>
                     ))}
                 </div>
             );
         };
 
-        const renderLongTextCounter = (value: string) => (
-            <div className="text-counter">{value.length} / {LONG_TEXT_LIMIT}</div>
+        const renderLongTextCounter = (value: string, limit: number) => (
+            <div className="text-counter">{value.length} / {limit}</div>
         );
 
-        const canEditCover = editMode === 'edit' && activeStory?.public_status === 'approved';
+        const canEditCover = true;
         const canDirectPublish = canUseDirectPublish(user);
         const currentCoverImage = typeof form.cover_image_url === 'string' && form.cover_image_url
             ? form.cover_image_url
@@ -3554,9 +3806,16 @@ export default function App() {
                             {editMode === 'new' ? '새 이야기 만들기' : `${form.title || '이야기'} 설정`}
                         </h1>
                     </div>
-                    <button className="btn btn-primary" onClick={saveStory}>
-                        <Sparkles size={16} /> 저장
-                    </button>
+                    <div style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                        {editMode === 'new' && (
+                            <button className="btn btn-outline" onClick={() => void openStoryTemplatePicker()}>
+                                <ScrollText size={16} /> 기존이야기 설정 가져오기
+                            </button>
+                        )}
+                        <button className="btn btn-primary" onClick={saveStory}>
+                            <Sparkles size={16} /> 저장
+                        </button>
+                    </div>
                 </div>
 
                 <div className="glass-panel home-limit-banner" style={{ marginBottom: '1rem' }}>
@@ -3600,31 +3859,41 @@ export default function App() {
 
                         <div className="input-group" style={{ marginBottom: 0 }}>
                             <label>공개 방식</label>
-                            <select
-                                className="input-control"
-                                value={form.public_method || 'private'}
-                                onChange={(e) => {
-                                    const next = e.target.value as StoryPublicMethod;
-                                    if (next === 'direct' && !canDirectPublish) return;
-                                    setForm({
-                                        ...form,
-                                        public_method: next,
-                                        is_public: next === 'approved' || next === 'direct',
-                                    });
-                                }}
-                            >
-                                <option value="private">비공개</option>
-                                <option value="request">관리자 승인 요청</option>
-                                <option value="direct" disabled={!canDirectPublish}>
-                                    즉시 커뮤니티 공개{canDirectPublish ? '' : ' (권한 필요)'}
-                                </option>
-                                {editMode === 'edit' && activeStory?.public_status === 'approved' && (
-                                    <option value="approved">승인 공개 유지</option>
-                                )}
-                            </select>
-                            <p className="input-help" style={{ marginTop: '0.45rem' }}>
-                                승인 요청은 관리자 검토 후 커뮤니티에 노출됩니다. 권한이 있으면 즉시 공개도 선택할 수 있습니다.
-                            </p>
+                            {editMode === 'edit' ? (
+                                <>
+                                    <select
+                                        className="input-control"
+                                        value={form.public_method || 'private'}
+                                        onChange={(e) => {
+                                            const next = e.target.value as StoryPublicMethod;
+                                            if (next === 'direct' && !canDirectPublish) return;
+                                            setForm({
+                                                ...form,
+                                                public_method: next,
+                                                is_public: next === 'approved' || next === 'direct',
+                                            });
+                                        }}
+                                    >
+                                        <option value="private">비공개</option>
+                                        <option value="request">관리자 승인 요청</option>
+                                        <option value="direct" disabled={!canDirectPublish}>
+                                            즉시 커뮤니티 공개{canDirectPublish ? '' : ' (권한 필요)'}
+                                        </option>
+                                        {editMode === 'edit' && activeStory?.public_status === 'approved' && (
+                                            <option value="approved">승인 공개 유지</option>
+                                        )}
+                                    </select>
+                                    <p className="input-help" style={{ marginTop: '0.45rem' }}>
+                                        승인 요청은 관리자 검토 후 커뮤니티에 노출됩니다. 권한이 있으면 즉시 공개도 선택할 수 있습니다.
+                                    </p>
+                                </>
+                            ) : (
+                                <div className="glass-panel" style={{ padding: '0.9rem 1rem', borderRadius: '14px' }}>
+                                    <p style={{ margin: 0, lineHeight: 1.6 }}>
+                                        새 이야기는 처음에는 <strong>비공개</strong>로만 생성됩니다. 생성 후 편집 화면에서 승인 요청을 보낼 수 있습니다.
+                                    </p>
+                                </div>
+                            )}
                         </div>
 
                         <div className="input-group" style={{ marginTop: '1rem', marginBottom: 0 }}>
@@ -3694,7 +3963,9 @@ export default function App() {
                                         <Trash2 size={18} />
                                     </button>
                                     <div className="character-head-row">
-                                        <h3 style={{ marginBottom: 0, fontSize: '1rem', color: 'var(--accent)' }}>등장인물 {index + 1}</h3>
+                                        <h3 style={{ marginBottom: 0, fontSize: '1rem', color: 'var(--accent)' }}>
+                                            등장인물 {index + 1}{editMode === 'new' && index === 0 && char.isProtagonist ? ' (주인공)' : ''}
+                                        </h3>
                                         <button
                                             type="button"
                                             className={`btn btn-outline character-protagonist-btn ${char.isProtagonist ? 'is-active' : ''}`}
@@ -3774,20 +4045,23 @@ export default function App() {
                                     </div>
 
                                     <div className="character-section">
-                                        <h4 className="section-title">행동</h4>
+                                        <div className="section-title-row">
+                                            <h4 className="section-title">행동</h4>
+                                            <span className="section-limit">최대 {BEHAVIOR_RULE_LIMIT}개 선택</span>
+                                        </div>
                                         <div className="input-group">
-                                            {renderChoiceGroup(index, 'behaviorRules', BEHAVIOR_RULE_OPTIONS, BEHAVIOR_RULE_OPTIONS.length, '행동')}
+                                            {renderChoiceGroup(index, 'behaviorRules', BEHAVIOR_RULE_OPTIONS, BEHAVIOR_RULE_LIMIT, '행동')}
                                         </div>
                                         <div className="input-group" style={{ marginBottom: 0 }}>
                                             <label>메모</label>
                                             <textarea
                                                 className="input-control"
-                                                maxLength={LONG_TEXT_LIMIT}
+                                                maxLength={CHARACTER_BEHAVIOR_LIMIT}
                                                 placeholder="예: 힘들어 보이면 먼저 안부를 묻는다."
                                                 value={char.customBehaviorRules}
                                                 onChange={e => handleLongTextChange(index, 'customBehaviorRules', e.target.value)}
                                             />
-                                            {renderLongTextCounter(char.customBehaviorRules)}
+                                            {renderLongTextCounter(char.customBehaviorRules, CHARACTER_BEHAVIOR_LIMIT)}
                                         </div>
                                     </div>
 
@@ -3800,45 +4074,50 @@ export default function App() {
                                     </div>
 
                                     <div className="character-section">
-                                        <h4 className="section-title">싫어함</h4>
+                                        <h4 className="section-title">좋아함 메모</h4>
+                                        <div className="input-group" style={{ marginBottom: 0 }}>
+                                            <label>메모</label>
+                                            <textarea
+                                                className="input-control"
+                                                maxLength={CHARACTER_LIKE_MEMO_LIMIT}
+                                                placeholder="예: 달콤한 디저트, 조용한 카페, 밤 산책"
+                                                value={char.customLikes}
+                                                onChange={e => handleLongTextChange(index, 'customLikes', e.target.value)}
+                                            />
+                                            {renderLongTextCounter(char.customLikes, CHARACTER_LIKE_MEMO_LIMIT)}
+                                        </div>
+                                    </div>
+
+                                    <div className="character-section">
+                                        <div className="section-title-row">
+                                            <h4 className="section-title">싫어함</h4>
+                                            <span className="section-limit">최대 {DISLIKE_LIMIT}개 선택</span>
+                                        </div>
                                         <div className="input-group">
-                                            {renderChoiceGroup(index, 'dislikes', DISLIKE_OPTIONS, DISLIKE_OPTIONS.length, '싫어함')}
+                                            {renderChoiceGroup(index, 'dislikes', DISLIKE_OPTIONS, DISLIKE_LIMIT, '싫어함')}
                                         </div>
                                         <div className="input-group" style={{ marginBottom: 0 }}>
                                             <label>메모</label>
                                             <textarea
                                                 className="input-control"
-                                                maxLength={LONG_TEXT_LIMIT}
+                                                maxLength={CHARACTER_DISLIKE_LIMIT}
                                                 placeholder="예: 무시당하는 상황, 예의 없는 농담"
                                                 value={char.customDislikes}
                                                 onChange={e => handleLongTextChange(index, 'customDislikes', e.target.value)}
                                             />
-                                            {renderLongTextCounter(char.customDislikes)}
+                                            {renderLongTextCounter(char.customDislikes, CHARACTER_DISLIKE_LIMIT)}
                                         </div>
                                     </div>
 
-                                    <div className="character-section">
-                                        <h4 className="section-title">이야기 속 역할</h4>
-                                        {renderSingleChoiceGroup(index, 'relationship', RELATIONSHIP_OPTIONS)}
-                                    </div>
-
-                                    <div className="character-section">
-                                        <h4 className="section-title">목표</h4>
-                                        <div className="input-group">
-                                            {renderChoiceGroup(index, 'goals', GOAL_OPTIONS, GOAL_OPTIONS.length, '목표')}
+                                    {!(editMode === 'new' && index === 0 && char.isProtagonist) && (
+                                        <div className="character-section">
+                                            <div className="section-title-row">
+                                                <h4 className="section-title">이야기 속 역할</h4>
+                                                <span className="section-limit">{STORY_ROLE_LIMIT}개 선택</span>
+                                            </div>
+                                            {renderSingleChoiceGroup(index, 'relationship', RELATIONSHIP_OPTIONS)}
                                         </div>
-                                        <div className="input-group" style={{ marginBottom: 0 }}>
-                                            <label>메모</label>
-                                            <textarea
-                                                className="input-control"
-                                                maxLength={LONG_TEXT_LIMIT}
-                                                placeholder="예: 위기에 놓이면 옆에서 힘이 되어준다."
-                                                value={char.customGoals}
-                                                onChange={e => handleLongTextChange(index, 'customGoals', e.target.value)}
-                                            />
-                                            {renderLongTextCounter(char.customGoals)}
-                                        </div>
-                                    </div>
+                                    )}
 
                                     <div className="character-section" style={{ marginBottom: 0 }}>
                                         <h4 className="section-title">개요</h4>
@@ -3846,13 +4125,13 @@ export default function App() {
                                             <label>메모</label>
                                             <textarea
                                                 className="input-control"
-                                                maxLength={LONG_TEXT_LIMIT}
+                                                maxLength={CHARACTER_BACKGROUND_LIMIT}
                                                 placeholder={'예)\n게임 스트리머로 활동하며\n인물들과 자연스럽게 어울린다.'}
                                                 value={char.background}
                                                 onChange={e => handleLongTextChange(index, 'background', e.target.value)}
                                             />
                                             <p className="input-help">예) 게임 스트리머로 활동하며 인물들과 자연스럽게 어울린다.</p>
-                                            {renderLongTextCounter(char.background)}
+                                            {renderLongTextCounter(char.background, CHARACTER_BACKGROUND_LIMIT)}
                                         </div>
                                     </div>
                                 </div>
@@ -3860,6 +4139,78 @@ export default function App() {
                         )}
                     </div>
                 </div>
+
+                {storyTemplatePickerOpen && (
+                    <div className="modal-overlay" onClick={() => setStoryTemplatePickerOpen(false)}>
+                        <div
+                            className="modal-content"
+                            style={{ maxWidth: '860px', width: 'min(94vw, 860px)', maxHeight: '82vh', overflow: 'hidden' }}
+                            onClick={(e) => e.stopPropagation()}
+                        >
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '1rem' }}>
+                                <div>
+                                    <span className="badge badge-green">기존 이야기 불러오기</span>
+                                    <h2 className="title-font" style={{ marginTop: '0.7rem', fontSize: '1.35rem' }}>
+                                        어떤 이야기 설정을 가져올까요?
+                                    </h2>
+                                    <p className="text-muted" style={{ marginTop: '0.45rem', lineHeight: 1.6 }}>
+                                        선택한 이야기의 제목, 배경, 환경, 등장인물, 공개 설정, 표지를 새 이야기 폼에 그대로 채웁니다.
+                                    </p>
+                                </div>
+                                <button className="btn btn-outline" onClick={() => setStoryTemplatePickerOpen(false)}>
+                                    닫기
+                                </button>
+                            </div>
+
+                            <div style={{ marginTop: '1rem', overflowY: 'auto', maxHeight: 'calc(82vh - 140px)', paddingRight: '0.25rem' }}>
+                                {stories.filter((story) => story.user_id === user.id).length === 0 ? (
+                                    <div className="glass-panel" style={{ textAlign: 'center', padding: '2rem' }}>
+                                        <p className="text-muted">가져올 수 있는 기존 이야기가 없습니다.</p>
+                                    </div>
+                                ) : (
+                                    <div style={{ display: 'grid', gap: '0.8rem' }}>
+                                        {stories
+                                            .filter((story) => story.user_id === user.id)
+                                            .sort((a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''))
+                                            .map((story) => (
+                                                <button
+                                                    key={story.id}
+                                                    type="button"
+                                                    className="glass-panel"
+                                                    onClick={() => applyStoryTemplate(story)}
+                                                    style={{
+                                                        textAlign: 'left',
+                                                        width: '100%',
+                                                        padding: '1rem',
+                                                        border: '1px solid rgba(80, 60, 30, 0.12)',
+                                                        cursor: 'pointer',
+                                                    }}
+                                                >
+                                                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'flex-start' }}>
+                                                        <div style={{ minWidth: 0, flex: 1 }}>
+                                                            <h3 style={{ margin: 0, fontSize: '1.05rem', color: '#fff' }}>{story.title}</h3>
+                                                            <p className="text-muted" style={{ marginTop: '0.4rem', lineHeight: 1.55 }}>
+                                                                {story.background?.slice(0, 110) || '배경 설명이 없습니다.'}
+                                                            </p>
+                                                            <p className="text-muted" style={{ marginTop: '0.35rem', fontSize: '0.84rem' }}>
+                                                                {story.environment ? `환경: ${story.environment.slice(0, 80)}` : '환경 미설정'} · 등장인물 {story.characters?.length || 0}명
+                                                            </p>
+                                                        </div>
+                                                        <div style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
+                                                            <span className={`badge ${resolveStoryVisibilityInfo(story).badge}`}>{resolveStoryVisibilityInfo(story).label}</span>
+                                                            <p className="text-muted" style={{ marginTop: '0.55rem', fontSize: '0.8rem' }}>
+                                                                {story.updated_at ? `최종 수정 ${story.updated_at.slice(0, 10)}` : '수정일 미상'}
+                                                            </p>
+                                                        </div>
+                                                    </div>
+                                                </button>
+                                            ))}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+                )}
             </div>
         );
     };
@@ -3901,8 +4252,8 @@ export default function App() {
                     const regex = new RegExp(`(${escapeRegExp(escapedName)})`, 'g');
                     htmlContent = htmlContent.replace(regex, '<span class="character-name-highlight">$1</span>');
                 });
-        }
-        return <span style={{ color: aiColorStr, transition: 'color 0.2s' }} dangerouslySetInnerHTML={{ __html: htmlContent }}></span>;
+            }
+            return <span style={{ color: aiColorStr, transition: 'color 0.2s' }} dangerouslySetInnerHTML={{ __html: htmlContent }}></span>;
         };
 
         const blockReaderProtection = (event: { preventDefault: () => void; target: EventTarget | null }) => {
@@ -3913,7 +4264,7 @@ export default function App() {
             event.preventDefault();
         };
 
-        const bindingQuoteEstimatedPages = estimateBindingPageCount({
+        const bindingQuoteEstimatedPages = bindingPreview?.pageCount ?? estimateBindingPageCount({
             title: activeStory?.title || '',
             background: activeStory?.background || '',
             environment: activeStory?.environment || '',
@@ -3922,8 +4273,9 @@ export default function App() {
             options: bindingOptions,
         });
         const bindingQuotePreviewOptions = bindingPreview?.options || bindingOptions;
+        const bindingQuotePointCostPerPage = pointData?.pointSettings?.bindingPointCostPerPage ?? 1;
         const bindingQuoteAuthorNoteLimit = Math.max(300, Math.min(1200, Math.floor(getBindingBodyBudget(DEFAULT_BINDING_VIEWER_SETTINGS) * 0.7)));
-        const bindingQuoteCost = bindingPreview?.cost ?? bindingQuoteEstimatedPages;
+        const bindingQuoteCost = calculateBindingPointCost(bindingQuoteEstimatedPages, bindingQuotePointCostPerPage);
         const bindingQuoteBalance = pointData?.pointBalance ?? user?.point_balance ?? 0;
         const bindingQuoteRemaining = bindingQuoteBalance - bindingQuoteCost;
 
@@ -4032,97 +4384,97 @@ export default function App() {
                             <ScrollText size={14} /> 제본용 출력
                         </button>
                         <div style={{ display: 'flex', gap: '0.5rem', position: 'relative' }}>
-                        <button className="btn-icon" onClick={() => setShowSettingsDrawer(!showSettingsDrawer)}>
-                            <Settings size={20} />
-                        </button>
-                        <button className="btn-icon" onClick={handleClearChat} title="초기화">
-                            <RefreshCw size={18} />
-                        </button>
+                            <button className="btn-icon" onClick={() => setShowSettingsDrawer(!showSettingsDrawer)}>
+                                <Settings size={20} />
+                            </button>
+                            <button className="btn-icon" onClick={handleClearChat} title="초기화">
+                                <RefreshCw size={18} />
+                            </button>
 
-                        {/* Settings Drawer (Restored) */}
-                        {showSettingsDrawer && (
-                            <div className="glass-panel" style={{
-                                position: 'absolute', top: '50px', right: 0, width: '320px', zIndex: 100,
-                                boxShadow: '0 10px 30px rgba(0,0,0,0.5)', padding: '1.5rem'
-                            }}>
-                                <h3 style={{ fontSize: '1rem', marginBottom: '1.2rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                                    <Settings size={18} /> 뷰어 설정
-                                </h3>
+                            {/* Settings Drawer (Restored) */}
+                            {showSettingsDrawer && (
+                                <div className="glass-panel" style={{
+                                    position: 'absolute', top: '50px', right: 0, width: '320px', zIndex: 100,
+                                    boxShadow: '0 10px 30px rgba(0,0,0,0.5)', padding: '1.5rem'
+                                }}>
+                                    <h3 style={{ fontSize: '1rem', marginBottom: '1.2rem', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                        <Settings size={18} /> 뷰어 설정
+                                    </h3>
 
-                                <div className="input-group">
-                                    <label>읽기 화면비</label>
-                                    <div style={{ display: 'flex', gap: '0.4rem' }}>
-                                        {(['full', 'wide', 'standard', 'tall'] as const).map(r => (
-                                            <button key={r} className={`btn btn-outline ${readerSettings.aspectRatio === r ? 'active' : ''}`}
-                                                style={{ flex: 1, padding: '0.4rem', fontSize: '0.75rem', borderColor: readerSettings.aspectRatio === r ? 'var(--accent)' : '' }}
-                                                onClick={() => setReaderSettings({ ...readerSettings, aspectRatio: r })}>
-                                                {r === 'full' ? '전체화면' : r === 'wide' ? '와이드' : r === 'standard' ? '표준' : '세로집중'}
-                                            </button>
-                                        ))}
+                                    <div className="input-group">
+                                        <label>읽기 화면비</label>
+                                        <div style={{ display: 'flex', gap: '0.4rem' }}>
+                                            {(['full', 'wide', 'standard', 'tall'] as const).map(r => (
+                                                <button key={r} className={`btn btn-outline ${readerSettings.aspectRatio === r ? 'active' : ''}`}
+                                                    style={{ flex: 1, padding: '0.4rem', fontSize: '0.75rem', borderColor: readerSettings.aspectRatio === r ? 'var(--accent)' : '' }}
+                                                    onClick={() => setReaderSettings({ ...readerSettings, aspectRatio: r })}>
+                                                    {r === 'full' ? '전체화면' : r === 'wide' ? '와이드' : r === 'standard' ? '표준' : '세로집중'}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    <div className="input-group">
+                                        <label>글꼴</label>
+                                        <select className="input-control" value={readerSettings.fontFamily} onChange={e => setReaderSettings({ ...readerSettings, fontFamily: e.target.value })} style={{ padding: '0.4rem' }}>
+                                            <option value="Gowun Batang">고운 바탕</option>
+                                            <option value="Noto Serif KR">본명조</option>
+                                            <option value="Nanum Myeongjo">나눔 명조</option>
+                                            <option value="Nanum Gothic">나눔 고딕</option>
+                                            <option value="Inter">인터 (기본)</option>
+                                        </select>
+                                    </div>
+
+                                    <div className="input-group">
+                                        <label>글자 크기 ({readerSettings.fontSize}px)</label>
+                                        <input type="range" min="14" max="32" value={readerSettings.fontSize}
+                                            onChange={e => setReaderSettings({ ...readerSettings, fontSize: Number(e.target.value) })} style={{ width: '100%' }} />
+                                    </div>
+
+                                    <div className="input-group">
+                                        <label style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
+                                            내 입력 색상 (RGB)
+                                            <div style={{ width: '16px', height: '16px', borderRadius: '4px', background: userColorStr, border: '1px solid var(--border-color)' }} />
+                                        </label>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#ef4444', width: '12px', fontSize: '12px' }}>R</span> <input type="range" min="0" max="255" value={readerSettings.userColorR} onChange={e => setReaderSettings({ ...readerSettings, userColorR: Number(e.target.value) })} style={{ flex: 1, accentColor: '#ef4444' }} /></div>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#22c55e', width: '12px', fontSize: '12px' }}>G</span> <input type="range" min="0" max="255" value={readerSettings.userColorG} onChange={e => setReaderSettings({ ...readerSettings, userColorG: Number(e.target.value) })} style={{ flex: 1, accentColor: '#22c55e' }} /></div>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#3b82f6', width: '12px', fontSize: '12px' }}>B</span> <input type="range" min="0" max="255" value={readerSettings.userColorB} onChange={e => setReaderSettings({ ...readerSettings, userColorB: Number(e.target.value) })} style={{ flex: 1, accentColor: '#3b82f6' }} /></div>
+                                        </div>
+                                    </div>
+
+                                    <div className="input-group">
+                                        <label style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
+                                            본문 글씨 색상 (RGB)
+                                            <div style={{ width: '16px', height: '16px', borderRadius: '4px', background: aiColorStr, border: '1px solid var(--border-color)' }} />
+                                        </label>
+                                        <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#ef4444', width: '12px', fontSize: '12px' }}>R</span> <input type="range" min="0" max="255" value={readerSettings.aiColorR} onChange={e => setReaderSettings({ ...readerSettings, aiColorR: Number(e.target.value) })} style={{ flex: 1, accentColor: '#ef4444' }} /></div>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#22c55e', width: '12px', fontSize: '12px' }}>G</span> <input type="range" min="0" max="255" value={readerSettings.aiColorG} onChange={e => setReaderSettings({ ...readerSettings, aiColorG: Number(e.target.value) })} style={{ flex: 1, accentColor: '#22c55e' }} /></div>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#3b82f6', width: '12px', fontSize: '12px' }}>B</span> <input type="range" min="0" max="255" value={readerSettings.aiColorB} onChange={e => setReaderSettings({ ...readerSettings, aiColorB: Number(e.target.value) })} style={{ flex: 1, accentColor: '#3b82f6' }} /></div>
+                                        </div>
+                                    </div>
+
+                                    <div className="input-group" style={{ marginBottom: 0 }}>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                                            <input type="checkbox" checked={readerSettings.showBackground}
+                                                onChange={e => setReaderSettings({ ...readerSettings, showBackground: e.target.checked })} />
+                                            배경 이미지 사용
+                                        </label>
+                                    </div>
+
+                                    <div className="input-group" style={{ marginBottom: 0 }}>
+                                        <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                                            <input type="checkbox" checked={readerSettings.hideUserText}
+                                                onChange={e => setReaderSettings({ ...readerSettings, hideUserText: e.target.checked })} />
+                                            내가 쓴 글 숨기기
+                                        </label>
+                                        <p className="input-help" style={{ marginTop: '0.45rem' }}>
+                                            ON이면 내가 입력한 내용은 감추고 AI가 작성한 글만 보여줍니다.
+                                        </p>
                                     </div>
                                 </div>
-
-                                <div className="input-group">
-                                    <label>글꼴</label>
-                                    <select className="input-control" value={readerSettings.fontFamily} onChange={e => setReaderSettings({ ...readerSettings, fontFamily: e.target.value })} style={{ padding: '0.4rem' }}>
-                                        <option value="Gowun Batang">고운 바탕</option>
-                                        <option value="Noto Serif KR">본명조</option>
-                                        <option value="Nanum Myeongjo">나눔 명조</option>
-                                        <option value="Nanum Gothic">나눔 고딕</option>
-                                        <option value="Inter">인터 (기본)</option>
-                                    </select>
-                                </div>
-
-                                <div className="input-group">
-                                    <label>글자 크기 ({readerSettings.fontSize}px)</label>
-                                    <input type="range" min="14" max="32" value={readerSettings.fontSize}
-                                        onChange={e => setReaderSettings({ ...readerSettings, fontSize: Number(e.target.value) })} style={{ width: '100%' }} />
-                                </div>
-
-                                <div className="input-group">
-                                    <label style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
-                                        내 입력 색상 (RGB)
-                                        <div style={{ width: '16px', height: '16px', borderRadius: '4px', background: userColorStr, border: '1px solid var(--border-color)' }} />
-                                    </label>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#ef4444', width: '12px', fontSize: '12px' }}>R</span> <input type="range" min="0" max="255" value={readerSettings.userColorR} onChange={e => setReaderSettings({ ...readerSettings, userColorR: Number(e.target.value) })} style={{ flex: 1, accentColor: '#ef4444' }} /></div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#22c55e', width: '12px', fontSize: '12px' }}>G</span> <input type="range" min="0" max="255" value={readerSettings.userColorG} onChange={e => setReaderSettings({ ...readerSettings, userColorG: Number(e.target.value) })} style={{ flex: 1, accentColor: '#22c55e' }} /></div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#3b82f6', width: '12px', fontSize: '12px' }}>B</span> <input type="range" min="0" max="255" value={readerSettings.userColorB} onChange={e => setReaderSettings({ ...readerSettings, userColorB: Number(e.target.value) })} style={{ flex: 1, accentColor: '#3b82f6' }} /></div>
-                                    </div>
-                                </div>
-
-                                <div className="input-group">
-                                    <label style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.8rem' }}>
-                                        본문 글씨 색상 (RGB)
-                                        <div style={{ width: '16px', height: '16px', borderRadius: '4px', background: aiColorStr, border: '1px solid var(--border-color)' }} />
-                                    </label>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#ef4444', width: '12px', fontSize: '12px' }}>R</span> <input type="range" min="0" max="255" value={readerSettings.aiColorR} onChange={e => setReaderSettings({ ...readerSettings, aiColorR: Number(e.target.value) })} style={{ flex: 1, accentColor: '#ef4444' }} /></div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#22c55e', width: '12px', fontSize: '12px' }}>G</span> <input type="range" min="0" max="255" value={readerSettings.aiColorG} onChange={e => setReaderSettings({ ...readerSettings, aiColorG: Number(e.target.value) })} style={{ flex: 1, accentColor: '#22c55e' }} /></div>
-                                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}><span style={{ color: '#3b82f6', width: '12px', fontSize: '12px' }}>B</span> <input type="range" min="0" max="255" value={readerSettings.aiColorB} onChange={e => setReaderSettings({ ...readerSettings, aiColorB: Number(e.target.value) })} style={{ flex: 1, accentColor: '#3b82f6' }} /></div>
-                                    </div>
-                                </div>
-
-                                <div className="input-group" style={{ marginBottom: 0 }}>
-                                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                                        <input type="checkbox" checked={readerSettings.showBackground}
-                                            onChange={e => setReaderSettings({ ...readerSettings, showBackground: e.target.checked })} />
-                                        배경 이미지 사용
-                                    </label>
-                                </div>
-
-                                <div className="input-group" style={{ marginBottom: 0 }}>
-                                    <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
-                                        <input type="checkbox" checked={readerSettings.hideUserText}
-                                            onChange={e => setReaderSettings({ ...readerSettings, hideUserText: e.target.checked })} />
-                                        내가 쓴 글 숨기기
-                                    </label>
-                                    <p className="input-help" style={{ marginTop: '0.45rem' }}>
-                                        ON이면 내가 입력한 내용은 감추고 AI가 작성한 글만 보여줍니다.
-                                    </p>
-                                </div>
-                            </div>
-                        )}
+                            )}
                         </div>
                     </div>
                 </div>
@@ -4245,7 +4597,7 @@ export default function App() {
                             <span className="badge badge-gold">A5 제본 출력</span>
                             <h2 className="title-font">제본용 포인트 안내</h2>
                             <p className="text-muted" style={{ lineHeight: 1.7, textAlign: 'center' }}>
-                                선택한 제본 페이지 합계당 1포인트가 차감됩니다. 아래 예상 차감 금액을 확인하고 제본 페이지로 이동할 수 있습니다.
+                                제본은 선택한 페이지 수에 따라 차감됩니다. 현재는 1페이지당 {formatPointAmount(bindingQuotePointCostPerPage)}가 적용됩니다.
                             </p>
                             <div className="points-modal-summary binding-quote-summary">
                                 <div>
@@ -4269,16 +4621,7 @@ export default function App() {
                                         onChange={(e) => updateBindingOption({ includeCover: e.target.checked })}
                                     />
                                     <span>표지 추가</span>
-                                    <strong>+1P</strong>
-                                </label>
-                                <label className="binding-option-row">
-                                    <input
-                                        type="checkbox"
-                                        checked={bindingQuotePreviewOptions.includeUserText}
-                                        onChange={(e) => updateBindingOption({ includeUserText: e.target.checked })}
-                                    />
-                                    <span>사용자 텍스트 포함</span>
-                                    <strong>기본 포함</strong>
+                                    <strong>+{formatPointAmount(bindingQuotePointCostPerPage)}</strong>
                                 </label>
                                 <label className="binding-option-row">
                                     <input
@@ -4287,12 +4630,12 @@ export default function App() {
                                         onChange={(e) => updateBindingOption({ includeAuthorNote: e.target.checked })}
                                     />
                                     <span>작가의 말 추가</span>
-                                    <strong>+1P</strong>
+                                    <strong>+{formatPointAmount(bindingQuotePointCostPerPage)}</strong>
                                 </label>
                             </div>
                             {bindingQuoteEstimatedPages === 0 && (
                                 <p className="text-negative" style={{ textAlign: 'center', fontSize: '0.82rem' }}>
-                                    출력할 페이지가 없습니다. 사용자 텍스트 포함 또는 제본 옵션을 다시 선택해 주세요.
+                                    출력할 페이지가 없습니다. AI가 생성한 글이 있는지 확인해 주세요.
                                 </p>
                             )}
                             {bindingQuotePreviewOptions.includeAuthorNote && (
@@ -4306,7 +4649,7 @@ export default function App() {
                                         placeholder="출력할 작가의 말을 입력하세요."
                                     />
                                     <p className="input-help" style={{ marginTop: '0.4rem' }}>
-                                        최대 {bindingQuoteAuthorNoteLimit}자까지 입력할 수 있습니다. 선택 시 1포인트가 추가 차감됩니다.
+                                        최대 {bindingQuoteAuthorNoteLimit}자까지 입력할 수 있습니다. 선택 시 1페이지분 포인트가 추가 차감됩니다.
                                     </p>
                                 </div>
                             )}
@@ -4315,6 +4658,12 @@ export default function App() {
                                     ? `포인트가 ${formatPointAmount(Math.abs(bindingQuoteRemaining))} 부족합니다. 충전이 필요합니다.`
                                     : `차감 후 예상 잔액: ${formatPointAmount(bindingQuoteRemaining)}`}
                             </p>
+                            {bindingPreview?.generatedBy === 'server' && bindingPreview.renderChecks && (
+                                <p className="text-muted" style={{ textAlign: 'center', fontSize: '0.78rem' }}>
+                                    서버 정제 완료 · {bindingPreview.renderChecks.normalizedMessageCount ?? 0}개 메시지 검사
+                                    {bindingPreview.renderChecks.warnings?.length ? ` · 주의 ${bindingPreview.renderChecks.warnings.length}건` : ''}
+                                </p>
+                            )}
                             {bindingQuotePreviewOptions.includeAuthorNote && !(bindingQuotePreviewOptions.authorNoteText || '').trim() && (
                                 <p className="text-negative" style={{ textAlign: 'center', fontSize: '0.82rem' }}>
                                     작가의 말을 입력해야 제본을 진행할 수 있습니다.
@@ -5054,6 +5403,75 @@ export default function App() {
                             </div>
                         )}
 
+                        <div className="glass-panel">
+                            <div className="section-title-row" style={{ marginBottom: '1rem' }}>
+                                <h3 className="section-title">포인트 정책</h3>
+                                <span className="section-limit">사용 기능별 직접 지정</span>
+                            </div>
+                            <p className="text-muted" style={{ marginTop: 0, marginBottom: '1rem', lineHeight: 1.6 }}>
+                                실제로 포인트를 사용하는 기능만 모아 두었습니다. 수정하면 대화와 제본의 다음 계산부터 바로 적용됩니다.
+                            </p>
+                            <div className="admin-point-grid">
+                                <div className="admin-point-panel">
+                                    <h3>대화 1회 차감</h3>
+                                    <div className="field-grid field-grid-two">
+                                        <label className="input-group" style={{ marginBottom: 0 }}>
+                                            <span className="input-help" style={{ marginTop: 0 }}>일반 회원</span>
+                                            <input
+                                                type="number"
+                                                min="0"
+                                                className="input-control"
+                                                value={adminPointSettingsDraft.chatPointCost}
+                                                onChange={(e) => setAdminPointSettingsDraft((current) => ({ ...current, chatPointCost: Math.max(0, Math.trunc(Number(e.target.value) || 0)) }))}
+                                            />
+                                        </label>
+                                        <label className="input-group" style={{ marginBottom: 0 }}>
+                                            <span className="input-help" style={{ marginTop: 0 }}>프리미엄 회원</span>
+                                            <input
+                                                type="number"
+                                                min="0"
+                                                className="input-control"
+                                                value={adminPointSettingsDraft.premiumChatPointCost}
+                                                onChange={(e) => setAdminPointSettingsDraft((current) => ({ ...current, premiumChatPointCost: Math.max(0, Math.trunc(Number(e.target.value) || 0)) }))}
+                                            />
+                                        </label>
+                                    </div>
+                                </div>
+                                <div className="admin-point-panel">
+                                    <h3>제본 1페이지 차감</h3>
+                                    <label className="input-group" style={{ marginBottom: 0 }}>
+                                        <span className="input-help" style={{ marginTop: 0 }}>A5 제본 출력</span>
+                                        <input
+                                            type="number"
+                                            min="0"
+                                            className="input-control"
+                                            value={adminPointSettingsDraft.bindingPointCostPerPage}
+                                            onChange={(e) => setAdminPointSettingsDraft((current) => ({ ...current, bindingPointCostPerPage: Math.max(0, Math.trunc(Number(e.target.value) || 0)) }))}
+                                        />
+                                    </label>
+                                </div>
+                            </div>
+                            {adminPointSettingsError && (
+                                <p className="text-negative" style={{ marginTop: '0.85rem' }}>{adminPointSettingsError}</p>
+                            )}
+                            <div className="admin-point-actions" style={{ marginTop: '1rem' }}>
+                                <button
+                                    className="btn btn-primary"
+                                    onClick={() => void handleAdminPointSettingsSave()}
+                                    disabled={adminPointSettingsSaving}
+                                >
+                                    <CircleDollarSign size={16} /> {adminPointSettingsSaving ? '저장 중...' : '정책 저장'}
+                                </button>
+                                <button
+                                    className="btn btn-outline"
+                                    onClick={() => setAdminPointSettingsDraft(normalizePointSettings(adminPointDashboard?.pointSettings || null))}
+                                    disabled={adminPointSettingsSaving}
+                                >
+                                    되돌리기
+                                </button>
+                            </div>
+                        </div>
+
                         <div className="admin-summary-grid">
                             {[
                                 { label: '총 잔액', value: pointSummary?.totalBalance ?? 0, sub: `회원 ${pointSummary?.userCount ?? 0}명` },
@@ -5238,319 +5656,319 @@ export default function App() {
                             </div>
 
                             <div className="admin-db-content">
-                            {adminDatabaseError && (
-                                <div className="admin-db-banner is-error">
-                                    {adminDatabaseError}
-                                </div>
-                            )}
-                            {adminDatabaseLoading && (
-                                <div className="admin-db-banner">
-                                    DB 통계를 불러오는 중입니다...
-                                </div>
-                            )}
-
-                            {adminDatabaseView === 'stats' && (
-                                <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
-                                    <div className="section-title-row">
-                                        <h2 className="section-title">통계</h2>
-                                        <span className="section-limit">{dashboard?.database.name || 'novelai_db'} · {chartRangeLabel}</span>
+                                {adminDatabaseError && (
+                                    <div className="admin-db-banner is-error">
+                                        {adminDatabaseError}
                                     </div>
-                                    <div className="admin-db-stat-grid">
-                                        {[
-                                            { label: 'DB 용량', value: summary?.databaseSizeMb ?? 0, kind: 'kb' },
-                                            { label: '총 회원', value: summary?.userCount ?? 0, kind: 'count' },
-                                            { label: '총 이야기', value: summary?.storyCount ?? 0, kind: 'count' },
-                                            { label: '총 메시지', value: summary?.messageCount ?? 0, kind: 'count' },
-                                            { label: '선택 기간 회원', value: rangeSummary?.userCount ?? 0, kind: 'count' },
-                                            { label: '선택 기간 이야기', value: rangeSummary?.storyCount ?? 0, kind: 'count' },
-                                            { label: '선택 기간 메시지', value: rangeSummary?.messageCount ?? 0, kind: 'count' },
-                                            { label: '버킷 수', value: rangeSummary?.bucketCount ?? 0, kind: 'count' },
-                                            { label: '버킷당 평균', value: rangeSummary?.avgCountPerBucket ?? 0, kind: 'decimal' },
-                                            { label: '활성 작성자', value: summary?.activeWriterCount ?? 0, kind: 'count' },
-                                        ].map((card) => (
-                                            <div key={card.label} className="admin-db-stat-card">
-                                                <span>{card.label}</span>
-                                                <strong>
-                                                    {card.kind === 'kb'
-                                                        ? `${Number(card.value || 0).toFixed(2)} MB`
-                                                        : card.kind === 'decimal'
-                                                            ? Number(card.value || 0).toFixed(2)
-                                                            : formatCount(card.value as number)}
-                                                </strong>
-                                            </div>
-                                        ))}
+                                )}
+                                {adminDatabaseLoading && (
+                                    <div className="admin-db-banner">
+                                        DB 통계를 불러오는 중입니다...
                                     </div>
+                                )}
 
-                                    <div className="admin-db-mini-grid">
-                                        <div className="admin-db-mini-panel">
-                                            <h3>선택 기간 요약</h3>
-                                            <div className="admin-db-mini-list">
-                                                <div className="admin-db-mini-row">
-                                                    <span>회원</span>
-                                                    <strong>{formatCount(rangeSummary?.userCount ?? 0)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>이야기</span>
-                                                    <strong>{formatCount(rangeSummary?.storyCount ?? 0)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>메시지</span>
-                                                    <strong>{formatCount(rangeSummary?.messageCount ?? 0)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>공개 이야기</span>
-                                                    <strong>{formatCount(rangeSummary?.publicStoryCount ?? 0)}</strong>
-                                                </div>
-                                            </div>
+                                {adminDatabaseView === 'stats' && (
+                                    <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
+                                        <div className="section-title-row">
+                                            <h2 className="section-title">통계</h2>
+                                            <span className="section-limit">{dashboard?.database.name || 'novelai_db'} · {chartRangeLabel}</span>
                                         </div>
-                                        <div className="admin-db-mini-panel">
-                                            <h3>활동 흐름</h3>
-                                            <div className="admin-db-mini-list">
-                                                <div className="admin-db-mini-row">
-                                                    <span>스토리 소유자</span>
-                                                    <strong>{formatCount(rangeSummary?.storyOwnerCount ?? 0)}</strong>
+                                        <div className="admin-db-stat-grid">
+                                            {[
+                                                { label: 'DB 용량', value: summary?.databaseSizeMb ?? 0, kind: 'kb' },
+                                                { label: '총 회원', value: summary?.userCount ?? 0, kind: 'count' },
+                                                { label: '총 이야기', value: summary?.storyCount ?? 0, kind: 'count' },
+                                                { label: '총 메시지', value: summary?.messageCount ?? 0, kind: 'count' },
+                                                { label: '선택 기간 회원', value: rangeSummary?.userCount ?? 0, kind: 'count' },
+                                                { label: '선택 기간 이야기', value: rangeSummary?.storyCount ?? 0, kind: 'count' },
+                                                { label: '선택 기간 메시지', value: rangeSummary?.messageCount ?? 0, kind: 'count' },
+                                                { label: '버킷 수', value: rangeSummary?.bucketCount ?? 0, kind: 'count' },
+                                                { label: '버킷당 평균', value: rangeSummary?.avgCountPerBucket ?? 0, kind: 'decimal' },
+                                                { label: '활성 작성자', value: summary?.activeWriterCount ?? 0, kind: 'count' },
+                                            ].map((card) => (
+                                                <div key={card.label} className="admin-db-stat-card">
+                                                    <span>{card.label}</span>
+                                                    <strong>
+                                                        {card.kind === 'kb'
+                                                            ? `${Number(card.value || 0).toFixed(2)} MB`
+                                                            : card.kind === 'decimal'
+                                                                ? Number(card.value || 0).toFixed(2)
+                                                                : formatCount(card.value as number)}
+                                                    </strong>
                                                 </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>활성 작성자</span>
-                                                    <strong>{formatCount(rangeSummary?.activeWriterCount ?? 0)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>버킷당 평균</span>
-                                                    <strong>{Number(rangeSummary?.avgCountPerBucket ?? 0).toFixed(2)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>데이터 포인트</span>
-                                                    <strong>{formatCount(periodUsage.length)}</strong>
-                                                </div>
-                                            </div>
+                                            ))}
                                         </div>
-                                    </div>
-                                </div>
-                            )}
 
-                            {adminDatabaseView === 'graph' && (
-                                <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
-                                    <div className="section-title-row">
-                                        <h2 className="section-title">그래프</h2>
-                                        <span className="section-limit">{chartRangeLabel}</span>
-                                    </div>
-                                    <div className="admin-db-chart-legend">
-                                        {chartTotals.map((series) => (
-                                            <button
-                                                key={series.key}
-                                                className={`admin-db-toggle-chip ${adminSeriesFilters[series.key] ? 'is-active' : ''}`}
-                                                onClick={() => toggleAdminSeriesFilter(series.key)}
-                                            >
-                                                <span className="admin-db-chip-dot" style={{ background: series.color }} />
-                                                <span>{series.label}</span>
-                                                <strong>{formatCount(series.total)}</strong>
-                                            </button>
-                                        ))}
-                                    </div>
-                                    <div className="admin-db-chart-shell">
-                                        {periodUsage.length > 0 ? (
-                                            <svg className="admin-db-chart" viewBox={`0 0 ${chartWidth} ${chartHeight}`} preserveAspectRatio="none">
-                                                {Array.from({ length: 5 }, (_, index) => {
-                                                    const ratio = index / 4;
-                                                    const y = chartPaddingTop + (chartInnerHeight * ratio);
-                                                    const value = Math.round(chartMax * (1 - ratio));
-                                                    return (
-                                                        <g key={index}>
-                                                            <line
-                                                                x1={chartPaddingX}
-                                                                y1={y}
-                                                                x2={chartWidth - chartPaddingX}
-                                                                y2={y}
-                                                                className="admin-db-chart-grid"
-                                                            />
-                                                            <text x={14} y={y + 4} className="admin-db-chart-label">
-                                                                {formatCount(value)}
-                                                            </text>
-                                                        </g>
-                                                    );
-                                                })}
-
-                                                {chartPoints.map((series) => (
-                                                    <path
-                                                        key={series.key}
-                                                        d={series.path}
-                                                        className="admin-db-chart-line"
-                                                        style={{ stroke: series.color }}
-                                                    />
-                                                ))}
-
-                                                {chartPoints.map((series) => {
-                                                    if (!periodUsage.length) return null;
-                                                    const lastRow = periodUsage[periodUsage.length - 1];
-                                                    const x = chartWidth - chartPaddingX;
-                                                    const y = chartPaddingTop + chartInnerHeight - (getSeriesValue(lastRow, series.key) / chartMax) * chartInnerHeight;
-                                                    return (
-                                                        <circle
-                                                            key={`${series.key}-dot`}
-                                                            cx={x}
-                                                            cy={y}
-                                                            r="4.5"
-                                                            fill={series.color}
-                                                            stroke="rgba(12, 13, 17, 0.9)"
-                                                            strokeWidth="2"
-                                                        />
-                                                    );
-                                                })}
-
-                                                {chartTicks.map((row, index) => {
-                                                    const x = periodUsage.length <= 1
-                                                        ? chartWidth / 2
-                                                        : chartPaddingX + (chartInnerWidth * periodUsage.indexOf(row) / (periodUsage.length - 1));
-                                                    const label = selectedRange?.granularity === 'hour' ? formatHourLabel(row.bucket) : formatDayLabel(row.bucket);
-                                                    return (
-                                                        <text key={`${row.bucket}-${index}`} x={x} y={chartHeight - 14} className="admin-db-chart-axis">
-                                                            {label}
-                                                        </text>
-                                                    );
-                                                })}
-                                            </svg>
-                                        ) : (
-                                            <div className="admin-db-empty-state">
-                                                선택된 기간에 데이터가 없습니다.
-                                            </div>
-                                        )}
-                                    </div>
-                                    <div className="admin-db-chart-note">
-                                        {selectedRange?.preset === 'custom'
-                                            ? '직접 지정한 기간의 회원 · 이야기 · 메시지 변화를 확인합니다.'
-                                            : '프리셋을 바꾸면 바로 그래프가 갱신됩니다.'}
-                                    </div>
-                                </div>
-                            )}
-
-                            {adminDatabaseView === 'distribution' && (
-                                <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
-                                    <div className="section-title-row">
-                                        <h2 className="section-title">분포</h2>
-                                        <span className="section-limit">회원 · 콘텐츠 · 작성 흐름</span>
-                                    </div>
-                                    <div className="admin-db-mini-grid">
-                                        <div className="admin-db-mini-panel">
-                                            <h3>회원 역할</h3>
-                                            <div className="admin-db-mini-list">
-                                                {(databaseStats?.roleCounts || []).map((row) => (
-                                                    <div key={row.label} className="admin-db-mini-row">
-                                                        <span>{row.label}</span>
-                                                        <strong>{formatCount(row.value)}</strong>
+                                        <div className="admin-db-mini-grid">
+                                            <div className="admin-db-mini-panel">
+                                                <h3>선택 기간 요약</h3>
+                                                <div className="admin-db-mini-list">
+                                                    <div className="admin-db-mini-row">
+                                                        <span>회원</span>
+                                                        <strong>{formatCount(rangeSummary?.userCount ?? 0)}</strong>
                                                     </div>
-                                                ))}
-                                            </div>
-                                        </div>
-                                        <div className="admin-db-mini-panel">
-                                            <h3>회원 로그인</h3>
-                                            <div className="admin-db-mini-list">
-                                                {(databaseStats?.providerCounts || []).map((row) => (
-                                                    <div key={row.label} className="admin-db-mini-row">
-                                                        <span>{row.label}</span>
-                                                        <strong>{formatCount(row.value)}</strong>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>이야기</span>
+                                                        <strong>{formatCount(rangeSummary?.storyCount ?? 0)}</strong>
                                                     </div>
-                                                ))}
-                                            </div>
-                                        </div>
-                                        <div className="admin-db-mini-panel">
-                                            <h3>메시지 역할</h3>
-                                            <div className="admin-db-mini-list">
-                                                {(databaseStats?.messageRoleCounts || []).map((row) => (
-                                                    <div key={row.label} className="admin-db-mini-row">
-                                                        <span>{row.label}</span>
-                                                        <strong>{formatCount(row.value)}</strong>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>메시지</span>
+                                                        <strong>{formatCount(rangeSummary?.messageCount ?? 0)}</strong>
                                                     </div>
-                                                ))}
+                                                    <div className="admin-db-mini-row">
+                                                        <span>공개 이야기</span>
+                                                        <strong>{formatCount(rangeSummary?.publicStoryCount ?? 0)}</strong>
+                                                    </div>
+                                                </div>
                                             </div>
-                                        </div>
-                                        <div className="admin-db-mini-panel">
-                                            <h3>비율</h3>
-                                            <div className="admin-db-mini-list">
-                                                <div className="admin-db-mini-row">
-                                                    <span>공개 이야기</span>
-                                                    <strong>{formatPercent(databaseStats?.averages.publicStoryRate)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>프리미엄 회원</span>
-                                                    <strong>{formatPercent(databaseStats?.averages.premiumRate)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>정지 회원</span>
-                                                    <strong>{formatPercent(databaseStats?.averages.suspendedRate)}</strong>
-                                                </div>
-                                                <div className="admin-db-mini-row">
-                                                    <span>활성 작성자</span>
-                                                    <strong>{formatPercent(databaseStats?.averages.activeWriterRate)}</strong>
+                                            <div className="admin-db-mini-panel">
+                                                <h3>활동 흐름</h3>
+                                                <div className="admin-db-mini-list">
+                                                    <div className="admin-db-mini-row">
+                                                        <span>스토리 소유자</span>
+                                                        <strong>{formatCount(rangeSummary?.storyOwnerCount ?? 0)}</strong>
+                                                    </div>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>활성 작성자</span>
+                                                        <strong>{formatCount(rangeSummary?.activeWriterCount ?? 0)}</strong>
+                                                    </div>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>버킷당 평균</span>
+                                                        <strong>{Number(rangeSummary?.avgCountPerBucket ?? 0).toFixed(2)}</strong>
+                                                    </div>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>데이터 포인트</span>
+                                                        <strong>{formatCount(periodUsage.length)}</strong>
+                                                    </div>
                                                 </div>
                                             </div>
                                         </div>
                                     </div>
-                                </div>
-                            )}
+                                )}
 
-                            {adminDatabaseView === 'filters' && (
-                                <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
-                                    <div className="section-title-row">
-                                        <h2 className="section-title">필터</h2>
-                                        <span className="section-limit">회원 / 이야기 / 메시지</span>
-                                    </div>
-                                    <div className="admin-db-filter-grid">
-                                        {chartTotals.map((series) => (
-                                            <button
-                                                key={series.key}
-                                                className={`admin-db-filter-card ${adminSeriesFilters[series.key] ? 'is-active' : ''}`}
-                                                onClick={() => toggleAdminSeriesFilter(series.key)}
-                                            >
-                                                <div className="admin-db-filter-head">
+                                {adminDatabaseView === 'graph' && (
+                                    <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
+                                        <div className="section-title-row">
+                                            <h2 className="section-title">그래프</h2>
+                                            <span className="section-limit">{chartRangeLabel}</span>
+                                        </div>
+                                        <div className="admin-db-chart-legend">
+                                            {chartTotals.map((series) => (
+                                                <button
+                                                    key={series.key}
+                                                    className={`admin-db-toggle-chip ${adminSeriesFilters[series.key] ? 'is-active' : ''}`}
+                                                    onClick={() => toggleAdminSeriesFilter(series.key)}
+                                                >
                                                     <span className="admin-db-chip-dot" style={{ background: series.color }} />
-                                                    <strong>{series.label}</strong>
-                                                </div>
-                                                <span className="admin-db-filter-value">{formatCount(series.total)}</span>
-                                                <small>{adminSeriesFilters[series.key] ? '차트에 표시됨' : '차트에서 숨김'}</small>
-                                            </button>
-                                        ))}
-                                    </div>
-                                    <div className="admin-db-note-grid">
-                                        <div className="admin-db-side-card">
-                                            <span>현재 표시</span>
-                                            <strong>
-                                                {chartSeries.filter((series) => adminSeriesFilters[series.key]).map((series) => series.label).join(' · ') || '없음'}
-                                            </strong>
-                                            <small>필터는 그래프와 함께 즉시 반영됩니다.</small>
+                                                    <span>{series.label}</span>
+                                                    <strong>{formatCount(series.total)}</strong>
+                                                </button>
+                                            ))}
                                         </div>
-                                        <div className="admin-db-side-card">
-                                            <span>선택 기간</span>
-                                            <strong>{chartRangeLabel}</strong>
-                                            <small>원하는 범위로 바꿔가며 비교할 수 있습니다.</small>
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
+                                        <div className="admin-db-chart-shell">
+                                            {periodUsage.length > 0 ? (
+                                                <svg className="admin-db-chart" viewBox={`0 0 ${chartWidth} ${chartHeight}`} preserveAspectRatio="none">
+                                                    {Array.from({ length: 5 }, (_, index) => {
+                                                        const ratio = index / 4;
+                                                        const y = chartPaddingTop + (chartInnerHeight * ratio);
+                                                        const value = Math.round(chartMax * (1 - ratio));
+                                                        return (
+                                                            <g key={index}>
+                                                                <line
+                                                                    x1={chartPaddingX}
+                                                                    y1={y}
+                                                                    x2={chartWidth - chartPaddingX}
+                                                                    y2={y}
+                                                                    className="admin-db-chart-grid"
+                                                                />
+                                                                <text x={14} y={y + 4} className="admin-db-chart-label">
+                                                                    {formatCount(value)}
+                                                                </text>
+                                                            </g>
+                                                        );
+                                                    })}
 
-                            {adminDatabaseView === 'tables' && (
-                                <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
-                                    <div className="section-title-row">
-                                        <h2 className="section-title">테이블</h2>
-                                        <span className="section-limit">{dashboard?.database.name || 'novelai_db'}</span>
+                                                    {chartPoints.map((series) => (
+                                                        <path
+                                                            key={series.key}
+                                                            d={series.path}
+                                                            className="admin-db-chart-line"
+                                                            style={{ stroke: series.color }}
+                                                        />
+                                                    ))}
+
+                                                    {chartPoints.map((series) => {
+                                                        if (!periodUsage.length) return null;
+                                                        const lastRow = periodUsage[periodUsage.length - 1];
+                                                        const x = chartWidth - chartPaddingX;
+                                                        const y = chartPaddingTop + chartInnerHeight - (getSeriesValue(lastRow, series.key) / chartMax) * chartInnerHeight;
+                                                        return (
+                                                            <circle
+                                                                key={`${series.key}-dot`}
+                                                                cx={x}
+                                                                cy={y}
+                                                                r="4.5"
+                                                                fill={series.color}
+                                                                stroke="rgba(12, 13, 17, 0.9)"
+                                                                strokeWidth="2"
+                                                            />
+                                                        );
+                                                    })}
+
+                                                    {chartTicks.map((row, index) => {
+                                                        const x = periodUsage.length <= 1
+                                                            ? chartWidth / 2
+                                                            : chartPaddingX + (chartInnerWidth * periodUsage.indexOf(row) / (periodUsage.length - 1));
+                                                        const label = selectedRange?.granularity === 'hour' ? formatHourLabel(row.bucket) : formatDayLabel(row.bucket);
+                                                        return (
+                                                            <text key={`${row.bucket}-${index}`} x={x} y={chartHeight - 14} className="admin-db-chart-axis">
+                                                                {label}
+                                                            </text>
+                                                        );
+                                                    })}
+                                                </svg>
+                                            ) : (
+                                                <div className="admin-db-empty-state">
+                                                    선택된 기간에 데이터가 없습니다.
+                                                </div>
+                                            )}
+                                        </div>
+                                        <div className="admin-db-chart-note">
+                                            {selectedRange?.preset === 'custom'
+                                                ? '직접 지정한 기간의 회원 · 이야기 · 메시지 변화를 확인합니다.'
+                                                : '프리셋을 바꾸면 바로 그래프가 갱신됩니다.'}
+                                        </div>
                                     </div>
-                                    <div className="admin-table-wrap">
-                                        <table className="admin-table admin-db-table">
-                                            <thead>
-                                                <tr><th>테이블</th><th>예상 행수</th><th>크기</th></tr>
-                                            </thead>
-                                            <tbody>
-                                                {(dashboard?.tableStats || []).map((row) => (
-                                                    <tr key={row.tableName}>
-                                                        <td>{row.tableName}</td>
-                                                        <td>{formatCount(row.estimatedRows)}</td>
-                                                        <td>{formatKb(row.sizeMb)}</td>
-                                                    </tr>
-                                                ))}
-                                            </tbody>
-                                        </table>
+                                )}
+
+                                {adminDatabaseView === 'distribution' && (
+                                    <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
+                                        <div className="section-title-row">
+                                            <h2 className="section-title">분포</h2>
+                                            <span className="section-limit">회원 · 콘텐츠 · 작성 흐름</span>
+                                        </div>
+                                        <div className="admin-db-mini-grid">
+                                            <div className="admin-db-mini-panel">
+                                                <h3>회원 역할</h3>
+                                                <div className="admin-db-mini-list">
+                                                    {(databaseStats?.roleCounts || []).map((row) => (
+                                                        <div key={row.label} className="admin-db-mini-row">
+                                                            <span>{row.label}</span>
+                                                            <strong>{formatCount(row.value)}</strong>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                            <div className="admin-db-mini-panel">
+                                                <h3>회원 로그인</h3>
+                                                <div className="admin-db-mini-list">
+                                                    {(databaseStats?.providerCounts || []).map((row) => (
+                                                        <div key={row.label} className="admin-db-mini-row">
+                                                            <span>{row.label}</span>
+                                                            <strong>{formatCount(row.value)}</strong>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                            <div className="admin-db-mini-panel">
+                                                <h3>메시지 역할</h3>
+                                                <div className="admin-db-mini-list">
+                                                    {(databaseStats?.messageRoleCounts || []).map((row) => (
+                                                        <div key={row.label} className="admin-db-mini-row">
+                                                            <span>{row.label}</span>
+                                                            <strong>{formatCount(row.value)}</strong>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                            <div className="admin-db-mini-panel">
+                                                <h3>비율</h3>
+                                                <div className="admin-db-mini-list">
+                                                    <div className="admin-db-mini-row">
+                                                        <span>공개 이야기</span>
+                                                        <strong>{formatPercent(databaseStats?.averages.publicStoryRate)}</strong>
+                                                    </div>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>프리미엄 회원</span>
+                                                        <strong>{formatPercent(databaseStats?.averages.premiumRate)}</strong>
+                                                    </div>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>정지 회원</span>
+                                                        <strong>{formatPercent(databaseStats?.averages.suspendedRate)}</strong>
+                                                    </div>
+                                                    <div className="admin-db-mini-row">
+                                                        <span>활성 작성자</span>
+                                                        <strong>{formatPercent(databaseStats?.averages.activeWriterRate)}</strong>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
-                                </div>
-                            )}
+                                )}
+
+                                {adminDatabaseView === 'filters' && (
+                                    <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
+                                        <div className="section-title-row">
+                                            <h2 className="section-title">필터</h2>
+                                            <span className="section-limit">회원 / 이야기 / 메시지</span>
+                                        </div>
+                                        <div className="admin-db-filter-grid">
+                                            {chartTotals.map((series) => (
+                                                <button
+                                                    key={series.key}
+                                                    className={`admin-db-filter-card ${adminSeriesFilters[series.key] ? 'is-active' : ''}`}
+                                                    onClick={() => toggleAdminSeriesFilter(series.key)}
+                                                >
+                                                    <div className="admin-db-filter-head">
+                                                        <span className="admin-db-chip-dot" style={{ background: series.color }} />
+                                                        <strong>{series.label}</strong>
+                                                    </div>
+                                                    <span className="admin-db-filter-value">{formatCount(series.total)}</span>
+                                                    <small>{adminSeriesFilters[series.key] ? '차트에 표시됨' : '차트에서 숨김'}</small>
+                                                </button>
+                                            ))}
+                                        </div>
+                                        <div className="admin-db-note-grid">
+                                            <div className="admin-db-side-card">
+                                                <span>현재 표시</span>
+                                                <strong>
+                                                    {chartSeries.filter((series) => adminSeriesFilters[series.key]).map((series) => series.label).join(' · ') || '없음'}
+                                                </strong>
+                                                <small>필터는 그래프와 함께 즉시 반영됩니다.</small>
+                                            </div>
+                                            <div className="admin-db-side-card">
+                                                <span>선택 기간</span>
+                                                <strong>{chartRangeLabel}</strong>
+                                                <small>원하는 범위로 바꿔가며 비교할 수 있습니다.</small>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+
+                                {adminDatabaseView === 'tables' && (
+                                    <div className="glass-panel admin-db-panel admin-db-panel-scrollless">
+                                        <div className="section-title-row">
+                                            <h2 className="section-title">테이블</h2>
+                                            <span className="section-limit">{dashboard?.database.name || 'novelai_db'}</span>
+                                        </div>
+                                        <div className="admin-table-wrap">
+                                            <table className="admin-table admin-db-table">
+                                                <thead>
+                                                    <tr><th>테이블</th><th>예상 행수</th><th>크기</th></tr>
+                                                </thead>
+                                                <tbody>
+                                                    {(dashboard?.tableStats || []).map((row) => (
+                                                        <tr key={row.tableName}>
+                                                            <td>{row.tableName}</td>
+                                                            <td>{formatCount(row.estimatedRows)}</td>
+                                                            <td>{formatKb(row.sizeMb)}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -5809,12 +6227,12 @@ export default function App() {
                                                 <div className="admin-detail-list">
                                                     {adminPointUserDetail.recentTransactions.slice(0, 5).map((tx) => (
                                                         <div key={tx.id} className="admin-detail-item">
-                                                <div className="admin-detail-item-head">
-                                                    <strong>{formatPointTransactionTypeLabel(tx.transactionType)}</strong>
-                                                    <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
-                                                        {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}
-                                                    </span>
-                                                </div>
+                                                            <div className="admin-detail-item-head">
+                                                                <strong>{formatPointTransactionTypeLabel(tx.transactionType)}</strong>
+                                                                <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
+                                                                    {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}
+                                                                </span>
+                                                            </div>
                                                             <p className="text-muted admin-detail-mini">
                                                                 {formatDateTime(tx.createdAt)} · 잔액 {formatPointAmount(tx.balanceAfter)}
                                                             </p>
@@ -5865,7 +6283,7 @@ export default function App() {
                                     <div className="admin-point-ledger-grid">
                                         {visiblePointLedger.map((tx) => (
                                             <div key={tx.id} className="admin-point-ledger-card">
-                                            <div className="admin-point-ledger-card-head">
+                                                <div className="admin-point-ledger-card-head">
                                                     <strong>{formatPointTransactionTypeLabel(tx.transactionType)}</strong>
                                                     <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
                                                         {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}

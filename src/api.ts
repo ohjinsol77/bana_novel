@@ -16,37 +16,37 @@ export async function fetchMe() {
     return res.json();
 }
 
-export async function requestPhoneVerification(data: { phoneNumber: string; purpose: 'signup' | 'identity' | 'adult' | 'topup'; createdForUserId?: number }) {
-    const res = await fetch(`${BASE}/auth/phone/request`, {
+export async function requestPassVerification(data: { phoneNumber: string; purpose: 'identity' | 'adult' | 'topup'; createdForUserId?: number }) {
+    const res = await fetch(`${BASE}/auth/pass/request`, {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify(data),
     });
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        const error = new Error(errData.error || `인증번호 전송에 실패했습니다 (${res.status})`);
+        const error = new Error(errData.error || `PASS 인증번호 전송에 실패했습니다 (${res.status})`);
         (error as Error & { status?: number }).status = res.status;
         throw error;
     }
     return res.json();
 }
 
-export async function verifyPhoneCode(data: { verificationId: number; code: string }) {
-    const res = await fetch(`${BASE}/auth/phone/verify`, {
+export async function verifyPassCode(data: { verificationId: number; code: string }) {
+    const res = await fetch(`${BASE}/auth/pass/verify`, {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify(data),
     });
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        const error = new Error(errData.error || `인증번호 확인에 실패했습니다 (${res.status})`);
+        const error = new Error(errData.error || `PASS 인증번호 확인에 실패했습니다 (${res.status})`);
         (error as Error & { status?: number }).status = res.status;
         throw error;
     }
     return res.json();
 }
 
-export async function registerLocalUser(data: { name: string; email: string; password: string; birthDate?: string; phoneVerificationToken: string }) {
+export async function registerLocalUser(data: { name: string; email: string; password: string }) {
     const res = await fetch(`${BASE}/auth/register`, {
         method: 'POST',
         headers: authHeaders(),
@@ -76,15 +76,15 @@ export async function loginLocalUser(data: { email: string; password: string }) 
     return res.json();
 }
 
-export async function completePhoneVerification(data: { verificationToken: string }) {
-    const res = await fetch(`${BASE}/auth/me/phone`, {
+export async function completePassVerification(data: { verificationToken: string }) {
+    const res = await fetch(`${BASE}/auth/me/pass`, {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify(data),
     });
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
-        const error = new Error(errData.error || `본인인증에 실패했습니다 (${res.status})`);
+        const error = new Error(errData.error || `PASS 인증에 실패했습니다 (${res.status})`);
         (error as Error & { status?: number }).status = res.status;
         throw error;
     }
@@ -100,6 +100,21 @@ export async function completeAdultVerification(data: { verificationToken: strin
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         const error = new Error(errData.error || `성인인증에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function startOauthLink(data: { provider: 'kakao' | 'google' | 'naver' }) {
+    const res = await fetch(`${BASE}/auth/link/start`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `SNS 연결을 시작할 수 없습니다 (${res.status})`);
         (error as Error & { status?: number }).status = res.status;
         throw error;
     }
@@ -372,6 +387,25 @@ export async function fetchAdminPointDashboard() {
     if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error(errData.error || `포인트 대시보드를 불러올 수 없습니다 (${res.status})`);
+    }
+    return res.json();
+}
+
+export async function updateAdminPointSettings(data: {
+    pointSettings: {
+        chatPointCost: number;
+        premiumChatPointCost: number;
+        bindingPointCostPerPage: number;
+    };
+}) {
+    const res = await fetch(`${BASE}/admin/points/settings`, {
+        method: 'PUT',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.error || `포인트 설정을 저장할 수 없습니다 (${res.status})`);
     }
     return res.json();
 }

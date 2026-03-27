@@ -1,4 +1,13 @@
 const MAX_LONG_TEXT_LENGTH = 1500;
+const CHARACTER_PERSONALITY_LIMIT = 3;
+const CHARACTER_SPEECH_STYLE_LIMIT = 2;
+const CHARACTER_BEHAVIOR_SELECTION_LIMIT = 2;
+const CHARACTER_LIKE_SELECTION_LIMIT = 2;
+const CHARACTER_DISLIKE_SELECTION_LIMIT = 2;
+const CHARACTER_BEHAVIOR_LIMIT = 300;
+const CHARACTER_LIKE_LIMIT = 100;
+const CHARACTER_DISLIKE_LIMIT = 100;
+const CHARACTER_BACKGROUND_LIMIT = 500;
 
 const PERSONA_OPTIONS = {
     gender: [
@@ -257,6 +266,7 @@ export function createEmptyPersona() {
         behaviorRules: [],
         customBehaviorRules: '',
         likes: [],
+        customLikes: '',
         dislikes: [],
         customDislikes: '',
         relationship: 'friend',
@@ -280,17 +290,18 @@ export function normalizeCharacterPayload(character = {}) {
         gender: OPTION_LOOKUPS.gender.has(source.gender) ? source.gender : 'other',
         job: toLimitedString(source.job, 100),
         residence: toLimitedString(source.residence, 100),
-        personality: sanitizeArray(source.personality, OPTION_LOOKUPS.personality, 5),
-        speechStyles: sanitizeArray(source.speechStyles, OPTION_LOOKUPS.speechStyles, 3),
-        behaviorRules: sanitizeArray(source.behaviorRules, OPTION_LOOKUPS.behaviorRules, PERSONA_OPTIONS.behaviorRules.length),
+        personality: sanitizeArray(source.personality, OPTION_LOOKUPS.personality, CHARACTER_PERSONALITY_LIMIT),
+        speechStyles: sanitizeArray(source.speechStyles, OPTION_LOOKUPS.speechStyles, CHARACTER_SPEECH_STYLE_LIMIT),
+        behaviorRules: sanitizeArray(source.behaviorRules, OPTION_LOOKUPS.behaviorRules, CHARACTER_BEHAVIOR_SELECTION_LIMIT),
         customBehaviorRules: toLimitedString(source.customBehaviorRules),
-        likes: sanitizeArray(source.likes, OPTION_LOOKUPS.likes, 5),
-        dislikes: sanitizeArray(source.dislikes, OPTION_LOOKUPS.dislikes, PERSONA_OPTIONS.dislikes.length),
-        customDislikes: toLimitedString(source.customDislikes),
+        likes: sanitizeArray(source.likes, OPTION_LOOKUPS.likes, CHARACTER_LIKE_SELECTION_LIMIT),
+        customLikes: toLimitedString(source.customLikes, CHARACTER_LIKE_LIMIT),
+        dislikes: sanitizeArray(source.dislikes, OPTION_LOOKUPS.dislikes, CHARACTER_DISLIKE_SELECTION_LIMIT),
+        customDislikes: toLimitedString(source.customDislikes, CHARACTER_DISLIKE_LIMIT),
         relationship: OPTION_LOOKUPS.relationship.has(source.relationship) ? source.relationship : 'friend',
         goals: sanitizeArray(source.goals, OPTION_LOOKUPS.goals, PERSONA_OPTIONS.goals.length),
         customGoals: toLimitedString(source.customGoals),
-        background: toLimitedString(source.background),
+        background: toLimitedString(source.background, CHARACTER_BACKGROUND_LIMIT),
     };
 }
 
@@ -342,6 +353,7 @@ function toEnglishDisplayText(values, lookupKey) {
 export function formatCharacterPersona(character) {
     const ageText = character.age === null ? 'unset' : `${character.age}`;
     const customBehaviorText = character.customBehaviorRules || 'none';
+    const customLikesText = character.customLikes || 'none';
     const customDislikesText = character.customDislikes || 'none';
     const customGoalsText = character.customGoals || 'none';
 
@@ -354,6 +366,7 @@ export function formatCharacterPersona(character) {
         `- Behavior: ${toEnglishDisplayText(character.behaviorRules, 'behaviorRules')}`,
         `- Custom behavior note: ${customBehaviorText}`,
         `- Likes: ${toEnglishDisplayText(character.likes, 'likes')}`,
+        `- Custom likes note: ${customLikesText}`,
         `- Dislikes: ${toEnglishDisplayText(character.dislikes, 'dislikes')}`,
         `- Custom dislike note: ${customDislikesText}`,
         `- Story role: ${OPTION_LOOKUPS_EN.relationship.get(character.relationship) || 'friend'}`,

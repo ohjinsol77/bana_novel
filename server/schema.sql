@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash VARCHAR(255) NULL,
     phone_number VARCHAR(30) NULL,
     phone_verified_at DATETIME NULL,
+    pass_verified_at DATETIME NULL,
     adult_verified_at DATETIME NULL,
     birth_date DATE NULL,
     role        ENUM('user','admin') DEFAULT 'user',
@@ -20,6 +21,21 @@ CREATE TABLE IF NOT EXISTS users (
     point_balance INT NOT NULL DEFAULT 0,
     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_oauth (oauth_id, provider)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS user_oauth_identities (
+    id                  INT AUTO_INCREMENT PRIMARY KEY,
+    user_id             INT NOT NULL,
+    provider            ENUM('kakao','google','naver') NOT NULL,
+    provider_user_id    VARCHAR(255) NOT NULL,
+    provider_email      VARCHAR(255) NULL,
+    provider_name       VARCHAR(100) NULL,
+    profile_img         VARCHAR(512) NULL,
+    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uniq_provider_identity (provider, provider_user_id),
+    UNIQUE KEY uniq_user_provider (user_id, provider),
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 이전 테이블 삭제 (초기화)
@@ -92,6 +108,7 @@ CREATE TABLE IF NOT EXISTS point_transactions (
 CREATE TABLE IF NOT EXISTS phone_verifications (
     id              INT AUTO_INCREMENT PRIMARY KEY,
     phone_number    VARCHAR(30) NOT NULL,
+    provider        ENUM('sms','pass') NOT NULL DEFAULT 'sms',
     purpose         ENUM('signup','identity','adult','topup') NOT NULL,
     code_hash       VARCHAR(255) NOT NULL,
     attempt_count   INT NOT NULL DEFAULT 0,

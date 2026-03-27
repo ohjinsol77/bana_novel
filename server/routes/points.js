@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../db.js';
-import { adjustUserPointBalance, getChatPointCostForUser, getStoryLimitForUser, POINT_TOP_UP_OPTIONS } from '../db.js';
+import { adjustUserPointBalance, getChatPointCostForUser, getPointSettings, getStoryLimitForUser, POINT_TOP_UP_OPTIONS } from '../db.js';
 import { resolveSessionUser } from '../session.js';
 
 const router = express.Router();
@@ -64,7 +64,7 @@ router.get('/me', auth, async (req, res) => {
     try {
         await conn.beginTransaction();
         const [rows] = await conn.query(
-            'SELECT point_balance AS pointBalance, is_premium AS isPremium, role FROM users WHERE id=? LIMIT 1',
+            'SELECT point_balance AS pointBalance, is_premium AS isPremium, role, pass_verified_at AS passVerifiedAt FROM users WHERE id=? LIMIT 1',
             [req.user.id]
         );
         if (!rows.length) {
@@ -85,9 +85,11 @@ router.get('/me', auth, async (req, res) => {
             chatCost,
             storyLimit,
             storyCount,
-            canCharge: Boolean(req.user.phone_verified_at || req.user.role === 'admin'),
-            identityVerified: Boolean(req.user.phone_verified_at),
-            adultVerified: Boolean(req.user.adult_verified_at),
+            pointSettings: getPointSettings(),
+            canCharge: Boolean(req.user.pass_verified_at || req.user.phone_verified_at || req.user.adult_verified_at || req.user.is_adult || req.user.role === 'admin'),
+            identityVerified: Boolean(req.user.pass_verified_at || req.user.phone_verified_at || req.user.adult_verified_at || req.user.is_adult),
+            passVerified: Boolean(req.user.pass_verified_at || req.user.phone_verified_at || req.user.adult_verified_at || req.user.is_adult),
+            adultVerified: Boolean(req.user.adult_verified_at || req.user.pass_verified_at || req.user.phone_verified_at || req.user.is_adult),
             topUpOptions: POINT_TOP_UP_OPTIONS,
             recentTransactions,
         });
@@ -113,10 +115,10 @@ router.post('/topup', auth, async (req, res) => {
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
-        if (req.user.role !== 'admin' && !req.user.phone_verified_at) {
-            const error = new Error('포인트 충전 전 본인인증이 필요합니다.');
+        if (req.user.role !== 'admin' && !req.user.pass_verified_at && !req.user.phone_verified_at && !req.user.adult_verified_at && !req.user.is_adult) {
+            const error = new Error('포인트 충전 전 PASS 본인확인이 필요합니다.');
             error.status = 403;
-            error.code = 'PHONE_VERIFICATION_REQUIRED';
+            error.code = 'PASS_VERIFICATION_REQUIRED';
             throw error;
         }
         const pointResult = await adjustUserPointBalance(conn, {
@@ -245,6 +247,7 @@ router.get('/admin/users/:id', auth, requireAdmin, async (req, res) => {
                 can_publish_community AS canPublishCommunity,
                 phone_number AS phoneNumber,
                 phone_verified_at AS phoneVerifiedAt,
+                pass_verified_at AS passVerifiedAt,
                 adult_verified_at AS adultVerifiedAt,
                 birth_date AS birthDate,
                 point_balance AS pointBalance,

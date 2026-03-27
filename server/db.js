@@ -21,10 +21,62 @@ const pool = mysql.createPool({
 export const WELCOME_POINT_BONUS = 50;
 export const NORMAL_STORY_LIMIT = 3;
 export const PREMIUM_STORY_LIMIT = 30;
-export const NORMAL_CHAT_POINT_COST = 15;
-export const PREMIUM_CHAT_POINT_COST = 10;
 export const POINT_TOP_UP_OPTIONS = [50, 100, 300, 500, 1000];
 export const PHONE_VERIFICATION_CODE_TTL_MINUTES = 10;
+export const DEFAULT_POINT_SETTINGS = {
+    chatPointCost: 15,
+    premiumChatPointCost: 10,
+    bindingPointCostPerPage: 1,
+};
+
+let pointSettingsCache = { ...DEFAULT_POINT_SETTINGS };
+
+function toIntOrDefault(value, fallback) {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+export function normalizePointSettings(input = {}) {
+    return {
+        chatPointCost: toIntOrDefault(input.chatPointCost ?? input.chat_point_cost, DEFAULT_POINT_SETTINGS.chatPointCost),
+        premiumChatPointCost: toIntOrDefault(input.premiumChatPointCost ?? input.premium_chat_point_cost, DEFAULT_POINT_SETTINGS.premiumChatPointCost),
+        bindingPointCostPerPage: toIntOrDefault(input.bindingPointCostPerPage ?? input.binding_point_cost_per_page, DEFAULT_POINT_SETTINGS.bindingPointCostPerPage),
+    };
+}
+
+export function getPointSettings() {
+    return { ...pointSettingsCache };
+}
+
+export function setPointSettings(nextSettings) {
+    pointSettingsCache = normalizePointSettings(nextSettings);
+    return getPointSettings();
+}
+
+export async function savePointSettings(conn, nextSettings) {
+    const normalized = normalizePointSettings(nextSettings);
+    await conn.query(
+        `
+        INSERT INTO point_settings (setting_key, setting_value)
+        VALUES
+            ('chat_point_cost', ?),
+            ('premium_chat_point_cost', ?),
+            ('binding_point_cost_per_page', ?)
+        ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+        `,
+        [
+            normalized.chatPointCost,
+            normalized.premiumChatPointCost,
+            normalized.bindingPointCostPerPage,
+        ]
+    );
+    setPointSettings(normalized);
+    return normalized;
+}
+
+export function getBindingPointCostPerPage() {
+    return getPointSettings().bindingPointCostPerPage;
+}
 
 function createAppError(message, status = 400, code = 'APP_ERROR', extra = {}) {
     const error = new Error(message);
@@ -40,7 +92,8 @@ export function getStoryLimitForUser(user) {
 }
 
 export function getChatPointCostForUser(user) {
-    return user?.is_premium ? PREMIUM_CHAT_POINT_COST : NORMAL_CHAT_POINT_COST;
+    const settings = getPointSettings();
+    return user?.is_premium ? settings.premiumChatPointCost : settings.chatPointCost;
 }
 
 export async function adjustUserPointBalance(conn, {
@@ -127,6 +180,23 @@ export async function initDB() {
                 point_balance INT NOT NULL DEFAULT 0,
                 created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY uniq_oauth (oauth_id, provider)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS user_oauth_identities (
+                id                  INT AUTO_INCREMENT PRIMARY KEY,
+                user_id             INT NOT NULL,
+                provider            ENUM('kakao','google','naver') NOT NULL,
+                provider_user_id    VARCHAR(255) NOT NULL,
+                provider_email      VARCHAR(255) NULL,
+                provider_name       VARCHAR(100) NULL,
+                profile_img         VARCHAR(512) NULL,
+                created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at          DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uniq_provider_identity (provider, provider_user_id),
+                UNIQUE KEY uniq_user_provider (user_id, provider),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `);
 
@@ -350,6 +420,18 @@ export async function initDB() {
             await conn.query('ALTER TABLE users ADD COLUMN phone_verified_at DATETIME NULL AFTER phone_number;');
         }
 
+        const [passVerifiedAtColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'pass_verified_at'
+            LIMIT 1
+        `);
+        if (!passVerifiedAtColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN pass_verified_at DATETIME NULL AFTER phone_verified_at;');
+        }
+
         const [adultVerifiedAtColumns] = await conn.query(`
             SELECT column_name
             FROM information_schema.columns
@@ -395,6 +477,13 @@ export async function initDB() {
         `);
 
         await conn.query(`
+            INSERT IGNORE INTO user_oauth_identities (user_id, provider, provider_user_id, provider_email, provider_name, profile_img)
+            SELECT id, provider, oauth_id, email, name, profile_img
+            FROM users
+            WHERE provider IN ('kakao', 'google', 'naver')
+        `);
+
+        await conn.query(`
             CREATE TABLE IF NOT EXISTS point_transactions (
                 id              INT AUTO_INCREMENT PRIMARY KEY,
                 user_id         INT NOT NULL,
@@ -414,9 +503,49 @@ export async function initDB() {
         `);
 
         await conn.query(`
+            CREATE TABLE IF NOT EXISTS point_settings (
+                setting_key VARCHAR(64) PRIMARY KEY,
+                setting_value INT NOT NULL DEFAULT 0,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+
+        const defaultSettings = normalizePointSettings(DEFAULT_POINT_SETTINGS);
+        for (const [settingKey, settingValue] of Object.entries({
+            chat_point_cost: defaultSettings.chatPointCost,
+            premium_chat_point_cost: defaultSettings.premiumChatPointCost,
+            binding_point_cost_per_page: defaultSettings.bindingPointCostPerPage,
+        })) {
+            await conn.query(
+                `
+                INSERT INTO point_settings (setting_key, setting_value)
+                VALUES (?, ?)
+                ON DUPLICATE KEY UPDATE setting_value = setting_value
+                `,
+                [settingKey, settingValue]
+            );
+        }
+
+        const [pointSettingRows] = await conn.query(`
+            SELECT setting_key AS settingKey, setting_value AS settingValue
+            FROM point_settings
+            WHERE setting_key IN ('chat_point_cost', 'premium_chat_point_cost', 'binding_point_cost_per_page')
+        `);
+        const loadedSettings = {
+            ...defaultSettings,
+            ...Object.fromEntries(pointSettingRows.map((row) => [row.settingKey, row.settingValue])),
+        };
+        setPointSettings({
+            chatPointCost: loadedSettings.chat_point_cost ?? loadedSettings.chatPointCost,
+            premiumChatPointCost: loadedSettings.premium_chat_point_cost ?? loadedSettings.premiumChatPointCost,
+            bindingPointCostPerPage: loadedSettings.binding_point_cost_per_page ?? loadedSettings.bindingPointCostPerPage,
+        });
+
+        await conn.query(`
             CREATE TABLE IF NOT EXISTS phone_verifications (
                 id              INT AUTO_INCREMENT PRIMARY KEY,
                 phone_number    VARCHAR(30) NOT NULL,
+                provider        ENUM('sms','pass') NOT NULL DEFAULT 'sms',
                 purpose         ENUM('signup','identity','adult','topup') NOT NULL,
                 code_hash       VARCHAR(255) NOT NULL,
                 attempt_count   INT NOT NULL DEFAULT 0,
@@ -429,6 +558,24 @@ export async function initDB() {
                 INDEX idx_phone_verifications_expires (expires_at),
                 FOREIGN KEY (created_for_user_id) REFERENCES users(id) ON DELETE SET NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+
+        const [phoneVerificationProviderColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'phone_verifications'
+              AND column_name = 'provider'
+            LIMIT 1
+        `);
+        if (!phoneVerificationProviderColumns.length) {
+            await conn.query("ALTER TABLE phone_verifications ADD COLUMN provider ENUM('sms','pass') NOT NULL DEFAULT 'sms' AFTER phone_number;");
+        }
+
+        await conn.query(`
+            UPDATE phone_verifications
+            SET provider = 'sms'
+            WHERE provider IS NULL OR provider = ''
         `);
 
         const [pointUserCreatedIndex] = await conn.query(`

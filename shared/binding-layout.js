@@ -7,9 +7,44 @@ export function getBindingBodyBudget(viewerSettings = {}) {
     return Math.max(420, Math.round(baseCharsPerPage * scale) - conservativeOverhead);
 }
 
+export function normalizeBindingText(text) {
+    const normalized = String(text || '')
+        .replace(/\r\n/g, '\n')
+        .replace(/\u00a0/g, ' ')
+        .replace(/\uFEFF/g, '');
+
+    const lines = normalized
+        .split('\n')
+        .map((line) => line.replace(/[ \t]+$/g, ''));
+
+    while (lines.length && !lines[0].trim()) {
+        lines.shift();
+    }
+
+    while (lines.length && !lines[lines.length - 1].trim()) {
+        lines.pop();
+    }
+
+    const compacted = [];
+    let blankRun = 0;
+
+    for (const line of lines) {
+        if (!line.trim()) {
+            blankRun += 1;
+            if (blankRun <= 1) compacted.push('');
+            continue;
+        }
+
+        blankRun = 0;
+        compacted.push(line);
+    }
+
+    return compacted.join('\n').trim();
+}
+
 export const DEFAULT_BINDING_OPTIONS = {
     includeCover: true,
-    includeUserText: true,
+    includeUserText: false,
     includeAuthorNote: false,
     authorNoteText: '',
 };
@@ -17,23 +52,29 @@ export const DEFAULT_BINDING_OPTIONS = {
 export function normalizeBindingOptions(options = {}) {
     return {
         includeCover: Boolean(options.includeCover ?? DEFAULT_BINDING_OPTIONS.includeCover),
-        includeUserText: Boolean(options.includeUserText ?? DEFAULT_BINDING_OPTIONS.includeUserText),
+        includeUserText: false,
         includeAuthorNote: Boolean(options.includeAuthorNote ?? DEFAULT_BINDING_OPTIONS.includeAuthorNote),
         authorNoteText: String(options.authorNoteText ?? DEFAULT_BINDING_OPTIONS.authorNoteText ?? '').trim(),
     };
 }
 
 export function estimateBindingTextCost(text, role) {
-    const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+    const normalized = normalizeBindingText(text);
     if (!normalized) return role === 'assistant' ? 24 : 20;
-    const linePenalty = (normalized.match(/\n/g) || []).length * 8;
+    const linePenalty = (normalized.match(/\n/g) || []).length * 5;
     const rolePenalty = 0;
-    const blockPenalty = role === 'assistant' ? 6 : 4;
+    const blockPenalty = role === 'assistant' ? 4 : 2;
     return normalized.length + linePenalty + rolePenalty + blockPenalty;
 }
 
+export function calculateBindingPointCost(pageCount, bindingPointCostPerPage = 1) {
+    const pages = Math.max(0, Math.trunc(Number(pageCount) || 0));
+    const perPage = Math.max(0, Math.trunc(Number(bindingPointCostPerPage) || 0));
+    return pages * perPage;
+}
+
 export function splitBindingText(text, budget) {
-    const normalized = String(text || '').replace(/\r\n/g, '\n').trim();
+    const normalized = normalizeBindingText(text);
     if (!normalized) return [''];
     if (normalized.length <= budget) return [normalized];
 
@@ -72,10 +113,21 @@ export function splitBindingText(text, budget) {
 
 function buildBindingBodyPages(messages = [], viewerSettings = {}) {
     const bodyBudget = getBindingBodyBudget(viewerSettings);
-    const pageBudget = bodyBudget;
     const pages = [];
     let currentBlocks = [];
     let currentCost = 0;
+    const pending = [];
+
+    for (const message of messages) {
+        const normalized = normalizeBindingText(message?.content || '');
+        if (!normalized) continue;
+        pending.push({
+            messageId: message.id,
+            role: message.role === 'user' ? 'user' : 'assistant',
+            content: normalized,
+            chunkIndex: 0,
+        });
+    }
 
     const flushPage = () => {
         if (!currentBlocks.length) return;
@@ -88,26 +140,60 @@ function buildBindingBodyPages(messages = [], viewerSettings = {}) {
         currentCost = 0;
     };
 
-    for (const message of messages) {
-        const role = message.role === 'user' ? 'user' : 'assistant';
-        const chunks = splitBindingText(String(message.content || ''), Math.max(320, Math.floor(pageBudget * 0.99)));
+    while (pending.length) {
+        const item = pending.shift();
+        const chunkCost = estimateBindingTextCost(item.content, item.role);
+        const remainingBudget = bodyBudget - currentCost;
 
-        for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
-            const chunk = chunks[chunkIndex];
-            const chunkCost = estimateBindingTextCost(chunk, role);
+        if (currentBlocks.length && chunkCost > remainingBudget) {
+            const splitBudget = Math.max(160, remainingBudget - 40);
+            const chunks = splitBindingText(item.content, splitBudget);
 
-            if (currentBlocks.length && currentCost + chunkCost > pageBudget) {
-                flushPage();
+            if (chunks.length > 1) {
+                pending.unshift(
+                    ...chunks.map((content, index) => ({
+                        ...item,
+                        content,
+                        chunkIndex: item.chunkIndex + index,
+                    }))
+                );
+                continue;
             }
 
-            currentBlocks.push({
-                id: `${message.id}-${chunkIndex}`,
-                role,
-                content: chunk,
-                chunkIndex,
-            });
-            currentCost += chunkCost;
+            flushPage();
+            pending.unshift(item);
+            continue;
         }
+
+        if (!currentBlocks.length && chunkCost > bodyBudget) {
+            const splitBudget = Math.max(160, bodyBudget - 40);
+            const chunks = splitBindingText(item.content, splitBudget);
+
+            if (chunks.length > 1) {
+                pending.unshift(
+                    ...chunks.map((content, index) => ({
+                        ...item,
+                        content,
+                        chunkIndex: item.chunkIndex + index,
+                    }))
+                );
+                continue;
+            }
+        }
+
+        if (currentBlocks.length && currentCost + chunkCost > bodyBudget) {
+            flushPage();
+            pending.unshift(item);
+            continue;
+        }
+
+        currentBlocks.push({
+            id: `${item.messageId}-${item.chunkIndex}`,
+            role: item.role,
+            content: item.content,
+            chunkIndex: item.chunkIndex,
+        });
+        currentCost += chunkCost;
     }
 
     flushPage();
@@ -148,7 +234,7 @@ function buildBindingFrontMatterPages(pages, options, bodyStartPage) {
 
 export function buildBindingPages(payload) {
     const options = normalizeBindingOptions(payload?.options);
-    const sourceMessages = options.includeUserText ? (payload?.messages || []) : (payload?.messages || []).filter((message) => message?.role !== 'user');
+    const sourceMessages = (payload?.messages || []).filter((message) => message?.role !== 'user');
     const bodyPages = buildBindingBodyPages(sourceMessages, payload?.viewerSettings);
     const bodyStartPage = 1 + (options.includeCover ? 1 : 0) + (options.includeAuthorNote ? 1 : 0);
     const frontMatterPages = buildBindingFrontMatterPages(bodyPages, options, bodyStartPage);

@@ -26,8 +26,11 @@ dotenv.config({ path: join(__dirname, '../.env') });
 
 const router = express.Router();
 const FRONTEND = process.env.FRONTEND_URL || 'http://localhost:5174';
+const API_BASE_URL = process.env.API_BASE_URL || 'http://localhost:4000/api';
 const PHONE_VERIFICATION_SECRET = process.env.PHONE_VERIFICATION_SECRET || process.env.JWT_SECRET;
+const OAUTH_LINK_SECRET = process.env.OAUTH_LINK_SECRET || process.env.JWT_SECRET;
 const PASSWORD_MIN_LENGTH = 8;
+const OAUTH_PROVIDERS = new Set(['kakao', 'google', 'naver']);
 
 function createAuthError(message, status = 400, code = 'AUTH_ERROR', extra = {}) {
     const error = new Error(message);
@@ -39,6 +42,18 @@ function createAuthError(message, status = 400, code = 'AUTH_ERROR', extra = {})
 
 function normalizeEmail(value) {
     return String(value || '').trim().toLowerCase();
+}
+
+function isValidEmail(value) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || '').trim());
+}
+
+function normalizeOAuthProvider(value) {
+    const provider = String(value || '').trim().toLowerCase();
+    if (!OAUTH_PROVIDERS.has(provider)) {
+        throw createAuthError('지원하지 않는 SNS입니다.', 400, 'INVALID_OAUTH_PROVIDER');
+    }
+    return provider;
 }
 
 function normalizePhoneNumber(value) {
@@ -89,12 +104,17 @@ function generateVerificationCode() {
     return String(randomInt(0, 1000000)).padStart(6, '0');
 }
 
+function getVerificationProviderForPurpose(purpose) {
+    return purpose === 'signup' ? 'sms' : 'pass';
+}
+
 function issuePhoneVerificationToken(payload) {
     return jwt.sign(
         {
             purpose: payload.purpose,
             verificationId: payload.verificationId,
             phoneNumber: payload.phoneNumber,
+            provider: payload.provider || getVerificationProviderForPurpose(payload.purpose),
         },
         PHONE_VERIFICATION_SECRET,
         { expiresIn: '10m' }
@@ -120,12 +140,42 @@ function buildAuthUserPayload(user) {
         can_publish_community: Boolean(user.can_publish_community),
         phone_number: user.phone_number || null,
         phone_verified_at: user.phone_verified_at || null,
+        pass_verified_at: user.pass_verified_at || null,
         adult_verified_at: user.adult_verified_at || null,
         birth_date: user.birth_date || null,
+        linked_providers: Array.isArray(user.linked_providers) ? user.linked_providers : [],
         point_balance: Number(user.point_balance || 0),
         story_limit: storyLimit,
         chat_point_cost: chatPointCost,
     };
+}
+
+function issueOAuthLinkState({ userId, provider }) {
+    return jwt.sign(
+        {
+            purpose: 'oauth_link',
+            userId,
+            provider,
+        },
+        OAUTH_LINK_SECRET,
+        { expiresIn: '10m' }
+    );
+}
+
+function verifyOAuthLinkState(state) {
+    const payload = jwt.verify(state, OAUTH_LINK_SECRET);
+    if (payload?.purpose !== 'oauth_link') {
+        throw createAuthError('잘못된 연결 요청입니다.', 400, 'INVALID_OAUTH_LINK_STATE');
+    }
+    return payload;
+}
+
+async function loadLinkedProvidersByUserId(connOrPool, userId) {
+    const [rows] = await connOrPool.query(
+        'SELECT provider FROM user_oauth_identities WHERE user_id=? ORDER BY provider',
+        [userId]
+    );
+    return rows.map((row) => row.provider);
 }
 
 async function sendVerificationCodeSms({ phoneNumber, code, purpose }) {
@@ -167,12 +217,60 @@ async function sendVerificationCodeSms({ phoneNumber, code, purpose }) {
     throw createAuthError('SMS 발송 설정이 필요합니다.', 500, 'SMS_PROVIDER_REQUIRED');
 }
 
-async function createPhoneVerification({ phoneNumber, purpose, createdForUserId = null }) {
+async function sendVerificationCodePass({ phoneNumber, code, purpose }) {
+    const providerUrl = process.env.PASS_API_URL || process.env.PASS_SMS_API_URL;
+    const providerKey = process.env.PASS_API_KEY || process.env.PASS_SMS_API_KEY;
+    const providerSender = process.env.PASS_SENDER || 'NovelAI PASS';
+
+    if (providerUrl && providerKey) {
+        const response = await fetch(providerUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${providerKey}`,
+            },
+            body: JSON.stringify({
+                to: phoneNumber,
+                sender: providerSender,
+                message: `[${providerSender}] PASS 인증번호는 ${code}입니다.`,
+                purpose,
+                provider: 'pass',
+            }),
+        });
+
+        if (!response.ok) {
+            const detail = await response.text().catch(() => '');
+            throw createAuthError(
+                `PASS 발송에 실패했습니다. ${detail || response.status}`,
+                502,
+                'PASS_SEND_FAILED'
+            );
+        }
+        return { provider: 'api' };
+    }
+
+    if (process.env.NODE_ENV !== 'production' || process.env.PASS_DEV_MODE === '1') {
+        console.log(`[PASS:${purpose}] ${phoneNumber} -> ${code}`);
+        return { provider: 'dev', code };
+    }
+
+    throw createAuthError('PASS 발송 설정이 필요합니다.', 500, 'PASS_PROVIDER_REQUIRED');
+}
+
+async function sendVerificationCodeByProvider({ provider, phoneNumber, code, purpose }) {
+    if (provider === 'pass') {
+        return sendVerificationCodePass({ phoneNumber, code, purpose });
+    }
+    return sendVerificationCodeSms({ phoneNumber, code, purpose });
+}
+
+async function createPhoneVerification({ phoneNumber, purpose, provider, createdForUserId = null }) {
     const normalizedPhone = normalizePhoneNumber(phoneNumber);
     const verificationPurpose = ['signup', 'identity', 'adult', 'topup'].includes(purpose) ? purpose : null;
     if (!verificationPurpose) {
         throw createAuthError('잘못된 인증 목적입니다.', 400, 'INVALID_VERIFICATION_PURPOSE');
     }
+    const verificationProvider = provider || getVerificationProviderForPurpose(verificationPurpose);
 
     const code = generateVerificationCode();
     const codeHash = await bcrypt.hash(code, 10);
@@ -185,15 +283,16 @@ async function createPhoneVerification({ phoneNumber, purpose, createdForUserId 
         const [result] = await conn.query(
             `
             INSERT INTO phone_verifications (
-                phone_number, purpose, code_hash, expires_at, created_for_user_id
-            ) VALUES (?, ?, ?, ?, ?)
+                phone_number, provider, purpose, code_hash, expires_at, created_for_user_id
+            ) VALUES (?, ?, ?, ?, ?, ?)
             `,
-            [normalizedPhone, verificationPurpose, codeHash, expiresAt, createdForUserId]
+            [normalizedPhone, verificationProvider, verificationPurpose, codeHash, expiresAt, createdForUserId]
         );
         await conn.commit();
         committed = true;
 
-        await sendVerificationCodeSms({
+        await sendVerificationCodeByProvider({
+            provider: verificationProvider,
             phoneNumber: normalizedPhone,
             code,
             purpose: verificationPurpose,
@@ -204,7 +303,8 @@ async function createPhoneVerification({ phoneNumber, purpose, createdForUserId 
             phoneNumber: normalizedPhone,
             maskedPhoneNumber: maskPhoneNumber(normalizedPhone),
             expiresAt: expiresAt.toISOString(),
-            code: process.env.NODE_ENV !== 'production' || process.env.SMS_DEV_MODE === '1' ? code : undefined,
+            provider: verificationProvider,
+            code: (process.env.NODE_ENV !== 'production' || process.env.SMS_DEV_MODE === '1' || process.env.PASS_DEV_MODE === '1') ? code : undefined,
         };
     } catch (err) {
         if (!committed) {
@@ -216,7 +316,7 @@ async function createPhoneVerification({ phoneNumber, purpose, createdForUserId 
     }
 }
 
-async function confirmPhoneVerification({ verificationId, code }) {
+async function confirmPhoneVerification({ verificationId, code, provider }) {
     const parsedVerificationId = Number(verificationId);
     const normalizedCode = String(code || '').trim();
     if (!Number.isInteger(parsedVerificationId) || parsedVerificationId <= 0) {
@@ -231,7 +331,7 @@ async function confirmPhoneVerification({ verificationId, code }) {
         await conn.beginTransaction();
         const [rows] = await conn.query(
             `
-            SELECT id, phone_number AS phoneNumber, purpose, code_hash AS codeHash, attempt_count AS attemptCount, expires_at AS expiresAt, verified_at AS verifiedAt, used_at AS usedAt
+            SELECT id, phone_number AS phoneNumber, provider, purpose, code_hash AS codeHash, attempt_count AS attemptCount, expires_at AS expiresAt, verified_at AS verifiedAt, used_at AS usedAt
             FROM phone_verifications
             WHERE id=?
             LIMIT 1
@@ -245,6 +345,9 @@ async function confirmPhoneVerification({ verificationId, code }) {
         }
 
         const record = rows[0];
+        if (provider && record.provider !== provider) {
+            throw createAuthError('인증 수단이 일치하지 않습니다.', 400, 'VERIFICATION_PROVIDER_MISMATCH');
+        }
         const now = new Date();
         if (record.usedAt) {
             throw createAuthError('이미 사용된 인증입니다.', 400, 'VERIFICATION_ALREADY_USED');
@@ -279,9 +382,11 @@ async function confirmPhoneVerification({ verificationId, code }) {
                 verificationId: parsedVerificationId,
                 phoneNumber: record.phoneNumber,
                 purpose: record.purpose,
+                provider: record.provider,
             }),
             phoneNumber: record.phoneNumber,
             purpose: record.purpose,
+            provider: record.provider,
         };
     } catch (err) {
         await conn.rollback();
@@ -305,42 +410,102 @@ async function readLocalUserByEmail(email) {
     return rows[0] || null;
 }
 
+async function loadOAuthIdentityUser(conn, provider, oauthId) {
+    const [rows] = await conn.query(
+        `
+        SELECT u.*
+        FROM user_oauth_identities i
+        INNER JOIN users u ON u.id = i.user_id
+        WHERE i.provider=? AND i.provider_user_id=?
+        LIMIT 1
+        FOR UPDATE
+        `,
+        [provider, oauthId]
+    );
+    return rows[0] || null;
+}
+
+async function loadLegacyOAuthUser(conn, provider, oauthId) {
+    const [rows] = await conn.query(
+        'SELECT * FROM users WHERE oauth_id=? AND provider=? LIMIT 1 FOR UPDATE',
+        [oauthId, provider]
+    );
+    return rows[0] || null;
+}
+
+async function upsertOAuthIdentity(conn, {
+    userId,
+    provider,
+    providerUserId,
+    email = null,
+    name = null,
+    profileImg = null,
+}) {
+    await conn.query(
+        `
+        INSERT INTO user_oauth_identities (user_id, provider, provider_user_id, provider_email, provider_name, profile_img)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            user_id = VALUES(user_id),
+            provider_email = VALUES(provider_email),
+            provider_name = VALUES(provider_name),
+            profile_img = VALUES(profile_img)
+        `,
+        [userId, provider, providerUserId, email, name, profileImg]
+    );
+}
+
+async function mergeUserRecords(conn, { targetUserId, sourceUserId }) {
+    if (Number(targetUserId) === Number(sourceUserId)) return;
+    await conn.query('UPDATE stories SET user_id=? WHERE user_id=?', [targetUserId, sourceUserId]);
+    await conn.query('UPDATE story_messages SET user_id=? WHERE user_id=?', [targetUserId, sourceUserId]);
+    await conn.query('UPDATE point_transactions SET user_id=? WHERE user_id=?', [targetUserId, sourceUserId]);
+    await conn.query('UPDATE point_transactions SET created_by=? WHERE created_by=?', [targetUserId, sourceUserId]);
+    await conn.query('UPDATE phone_verifications SET created_for_user_id=? WHERE created_for_user_id=?', [targetUserId, sourceUserId]);
+    await conn.query('UPDATE user_oauth_identities SET user_id=? WHERE user_id=?', [targetUserId, sourceUserId]);
+    await conn.query('DELETE FROM users WHERE id=?', [sourceUserId]);
+}
+
 // ── Upsert user & issue JWT ──────────────────────────────────
 async function upsertUser({ oauth_id, provider, name, email, profile_img }) {
+    const normalizedProvider = normalizeOAuthProvider(provider);
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
 
-        const [existingRows] = await conn.query(
-            'SELECT * FROM users WHERE oauth_id=? AND provider=? LIMIT 1 FOR UPDATE',
-            [oauth_id, provider]
-        );
-        const isNew = !existingRows.length;
+        let user = await loadOAuthIdentityUser(conn, normalizedProvider, oauth_id);
+        const foundByIdentity = Boolean(user);
+        let isNew = false;
 
-        if (isNew) {
+        if (!user) {
+            user = await loadLegacyOAuthUser(conn, normalizedProvider, oauth_id);
+        }
+
+        if (!user) {
             await conn.query(
                 `INSERT INTO users (oauth_id, provider, name, email, profile_img, point_balance)
                  VALUES (?, ?, ?, ?, ?, 0)`,
-                [oauth_id, provider, name, email, profile_img]
+                [oauth_id, normalizedProvider, name, email, profile_img]
             );
-        } else {
+            user = await loadLegacyOAuthUser(conn, normalizedProvider, oauth_id);
+            isNew = true;
+        } else if (!foundByIdentity || user.provider !== 'local') {
             await conn.query(
                 `UPDATE users
                  SET name=?, email=?, profile_img=?
-                 WHERE oauth_id=? AND provider=?`,
-                [name, email, profile_img, oauth_id, provider]
+                 WHERE id=?`,
+                [name, email, profile_img, user.id]
             );
         }
 
-        const [users] = await conn.query(
-            `SELECT *
-             FROM users
-             WHERE oauth_id=? AND provider=?
-             LIMIT 1
-             FOR UPDATE`,
-            [oauth_id, provider]
-        );
-        const user = users[0];
+        await upsertOAuthIdentity(conn, {
+            userId: user.id,
+            provider: normalizedProvider,
+            providerUserId: oauth_id,
+            email,
+            name,
+            profileImg: profile_img,
+        });
 
         if (isNew) {
             const result = await adjustUserPointBalance(conn, {
@@ -354,8 +519,74 @@ async function upsertUser({ oauth_id, provider, name, email, profile_img }) {
             user.point_balance = result.afterBalance;
         }
 
+        user.linked_providers = await loadLinkedProvidersByUserId(conn, user.id);
+
         await conn.commit();
         return user;
+    } catch (err) {
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
+    }
+}
+
+async function linkOAuthIdentityToUser({ userId, provider, oauthId, name, email, profileImg }) {
+    const normalizedProvider = normalizeOAuthProvider(provider);
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [targetRows] = await conn.query(
+            'SELECT * FROM users WHERE id=? LIMIT 1 FOR UPDATE',
+            [userId]
+        );
+        if (!targetRows.length) {
+            throw createAuthError('사용자를 찾을 수 없습니다.', 404, 'USER_NOT_FOUND');
+        }
+
+        const targetUser = targetRows[0];
+        if (targetUser.provider !== 'local') {
+            throw createAuthError('일반 계정에서만 SNS 연결이 가능합니다.', 400, 'OAUTH_LINK_REQUIRES_LOCAL');
+        }
+
+        const [identityRows] = await conn.query(
+            `
+            SELECT id, user_id AS userId, provider, provider_user_id AS providerUserId
+            FROM user_oauth_identities
+            WHERE provider=? AND provider_user_id=?
+            LIMIT 1
+            FOR UPDATE
+            `,
+            [normalizedProvider, oauthId]
+        );
+
+        if (identityRows.length) {
+            const identity = identityRows[0];
+            if (Number(identity.userId) !== Number(userId)) {
+                await mergeUserRecords(conn, {
+                    targetUserId: userId,
+                    sourceUserId: Number(identity.userId),
+                });
+            }
+        }
+
+        await upsertOAuthIdentity(conn, {
+            userId,
+            provider: normalizedProvider,
+            providerUserId: oauthId,
+            email,
+            name,
+            profileImg,
+        });
+
+        const linkedProviders = await loadLinkedProvidersByUserId(conn, userId);
+
+        await conn.commit();
+        return {
+            ...targetUser,
+            linked_providers: linkedProviders,
+        };
     } catch (err) {
         await conn.rollback();
         throw err;
@@ -426,14 +657,13 @@ passport.use(new KakaoStrategy({
     callbackURL: process.env.KAKAO_CALLBACK_URL,
 }, async (accessToken, refreshToken, profile, done) => {
     try {
-        const user = await upsertUser({
+        done(null, {
             oauth_id: String(profile.id),
             provider: 'kakao',
             name: profile.displayName || profile.username,
             email: profile._json?.kakao_account?.email,
             profile_img: profile._json?.properties?.profile_image,
         });
-        done(null, user);
     } catch (e) { done(e); }
 }));
 
@@ -443,14 +673,13 @@ passport.use(new GoogleStrategy({
     callbackURL: process.env.GOOGLE_CALLBACK_URL,
 }, async (accessToken, refreshToken, profile, done) => {
     try {
-        const user = await upsertUser({
+        done(null, {
             oauth_id: profile.id,
             provider: 'google',
             name: profile.displayName,
             email: profile.emails?.[0]?.value,
             profile_img: profile.photos?.[0]?.value,
         });
-        done(null, user);
     } catch (e) { done(e); }
 }));
 
@@ -460,21 +689,54 @@ passport.use(new NaverStrategy({
     callbackURL: process.env.NAVER_CALLBACK_URL,
 }, async (accessToken, refreshToken, profile, done) => {
     try {
-        const user = await upsertUser({
+        done(null, {
             oauth_id: String(profile.id),
             provider: 'naver',
             name: profile.displayName,
             email: profile.email,
             profile_img: profile.profileImage,
         });
-        done(null, user);
     } catch (e) { done(e); }
 }));
 
 // ── Routes ───────────────────────────────────────────────────
-const oauthCallback = (provider) => (req, res) => {
-    const token = makeToken(req.user);
-    res.redirect(`${FRONTEND}/?token=${token}`);
+const startOAuth = (provider, options = {}) => (req, res, next) => {
+    const state = String(req.query.state || '').trim();
+    return passport.authenticate(provider, {
+        ...options,
+        session: false,
+        state: state || undefined,
+    })(req, res, next);
+};
+
+const oauthCallback = (provider) => async (req, res) => {
+    try {
+        const state = String(req.query.state || '').trim();
+        if (state) {
+            const payload = verifyOAuthLinkState(state);
+            if (payload.provider !== provider) {
+                throw createAuthError('SNS 연결 대상이 일치하지 않습니다.', 400, 'OAUTH_LINK_PROVIDER_MISMATCH');
+            }
+
+            await linkOAuthIdentityToUser({
+                userId: Number(payload.userId),
+                provider,
+                oauthId: String(req.user?.oauth_id || ''),
+                name: req.user?.name || '',
+                email: req.user?.email || null,
+                profileImg: req.user?.profile_img || null,
+            });
+            return res.redirect(`${FRONTEND}/profile?linkSuccess=1`);
+        }
+
+        const user = await upsertUser(req.user);
+        const token = makeToken(user);
+        res.redirect(`${FRONTEND}/?token=${token}`);
+    } catch (err) {
+        console.error(`${provider} OAuth callback failed:`, err);
+        const message = encodeURIComponent(err.message || 'SNS 연결에 실패했습니다.');
+        res.redirect(`${FRONTEND}/profile?linkError=${message}`);
+    }
 };
 
 router.get('/apple', async (_req, res) => {
@@ -499,11 +761,39 @@ router.post('/phone/request', async (req, res) => {
             verificationId: payload.verificationId,
             maskedPhoneNumber: payload.maskedPhoneNumber,
             expiresAt: payload.expiresAt,
+            provider: payload.provider,
             debugCode: payload.code,
         });
     } catch (err) {
         res.status(err.status || 500).json({
             error: err.message || '인증번호 전송에 실패했습니다.',
+            code: err.code || null,
+        });
+    }
+});
+
+router.post('/pass/request', async (req, res) => {
+    try {
+        const purpose = String(req.body?.purpose || '').trim();
+        if (!['identity', 'adult', 'topup'].includes(purpose)) {
+            return res.status(400).json({ error: 'PASS 인증은 본인확인, 성인인증, 충전용으로만 사용할 수 있습니다.' });
+        }
+        const payload = await createPhoneVerification({
+            phoneNumber: req.body?.phoneNumber,
+            purpose,
+            provider: 'pass',
+            createdForUserId: req.body?.createdForUserId ? Number(req.body.createdForUserId) : null,
+        });
+        res.json({
+            verificationId: payload.verificationId,
+            maskedPhoneNumber: payload.maskedPhoneNumber,
+            expiresAt: payload.expiresAt,
+            provider: payload.provider,
+            debugCode: payload.code,
+        });
+    } catch (err) {
+        res.status(err.status || 500).json({
+            error: err.message || 'PASS 인증번호 전송에 실패했습니다.',
             code: err.code || null,
         });
     }
@@ -527,12 +817,55 @@ router.post('/phone/verify', async (req, res) => {
     }
 });
 
+router.post('/pass/verify', async (req, res) => {
+    try {
+        const payload = await confirmPhoneVerification({
+            verificationId: req.body?.verificationId,
+            code: req.body?.code,
+            provider: 'pass',
+        });
+        if (!['identity', 'adult', 'topup'].includes(payload.purpose)) {
+            return res.status(400).json({ error: 'PASS 인증용 인증만 사용할 수 있습니다.' });
+        }
+        res.json({
+            ...payload,
+            expiresInMinutes: PHONE_VERIFICATION_CODE_TTL_MINUTES,
+        });
+    } catch (err) {
+        res.status(err.status || 500).json({
+            error: err.message || 'PASS 인증번호 확인에 실패했습니다.',
+            code: err.code || null,
+        });
+    }
+});
+
+router.post('/link/start', async (req, res) => {
+    try {
+        const user = await resolveSessionUser(req);
+        const provider = normalizeOAuthProvider(req.body?.provider);
+
+        const state = issueOAuthLinkState({
+            userId: user.id,
+            provider,
+        });
+
+        res.json({
+            provider,
+            state,
+            url: `${API_BASE_URL}/auth/${provider}?state=${encodeURIComponent(state)}`,
+        });
+    } catch (err) {
+        res.status(err.status || 500).json({
+            error: err.message || 'SNS 연결 시작에 실패했습니다.',
+            code: err.code || null,
+        });
+    }
+});
+
 router.post('/register', async (req, res) => {
     const name = String(req.body?.name || '').trim();
     const email = normalizeEmail(req.body?.email);
     const password = String(req.body?.password || '');
-    const birthDate = normalizeBirthDate(req.body?.birthDate);
-    const phoneVerificationToken = String(req.body?.phoneVerificationToken || '').trim();
 
     if (!name) {
         return res.status(400).json({ error: '이름을 입력해주세요.' });
@@ -540,22 +873,11 @@ router.post('/register', async (req, res) => {
     if (!email) {
         return res.status(400).json({ error: '이메일을 입력해주세요.' });
     }
+    if (!isValidEmail(email)) {
+        return res.status(400).json({ error: '이메일 형식이 올바르지 않습니다.' });
+    }
     if (!password || password.length < PASSWORD_MIN_LENGTH) {
         return res.status(400).json({ error: `비밀번호는 최소 ${PASSWORD_MIN_LENGTH}자 이상이어야 합니다.` });
-    }
-    if (!phoneVerificationToken) {
-        return res.status(400).json({ error: '휴대폰 인증이 필요합니다.' });
-    }
-
-    let verificationPayload;
-    try {
-        verificationPayload = verifyPhoneVerificationToken(phoneVerificationToken);
-    } catch {
-        return res.status(400).json({ error: '휴대폰 인증 정보가 유효하지 않습니다.' });
-    }
-
-    if (verificationPayload.purpose !== 'signup') {
-        return res.status(400).json({ error: '회원가입용 인증만 사용할 수 있습니다.' });
     }
 
     const conn = await pool.getConnection();
@@ -572,23 +894,18 @@ router.post('/register', async (req, res) => {
 
         const passwordHash = await bcrypt.hash(password, 12);
         const oauthId = `local:${email}`;
-        const isAdult = birthDate ? isAdultBirthDate(birthDate) : false;
         const [insertResult] = await conn.query(
             `
             INSERT INTO users (
                 oauth_id, provider, name, email, password_hash, phone_number,
                 phone_verified_at, birth_date, is_adult, adult_verified_at, point_balance
-            ) VALUES (?, 'local', ?, ?, ?, ?, NOW(), ?, ?, ?, 0)
+            ) VALUES (?, 'local', ?, ?, ?, NULL, NULL, NULL, 0, NULL, 0)
             `,
             [
                 oauthId,
                 name,
                 email,
                 passwordHash,
-                verificationPayload.phoneNumber,
-                birthDate,
-                isAdult ? 1 : 0,
-                isAdult ? new Date() : null,
             ]
         );
 
@@ -597,11 +914,6 @@ router.post('/register', async (req, res) => {
             [insertResult.insertId]
         );
         const user = users[0];
-
-        await conn.query(
-            'UPDATE phone_verifications SET used_at=NOW(), created_for_user_id=? WHERE id=?',
-            [user.id, verificationPayload.verificationId]
-        );
 
         const welcome = await adjustUserPointBalance(conn, {
             userId: user.id,
@@ -674,19 +986,19 @@ router.post('/login', async (req, res) => {
 });
 
 // Kakao
-router.get('/kakao', passport.authenticate('kakao'));
+router.get('/kakao', startOAuth('kakao'));
 router.get('/kakao/callback',
     passport.authenticate('kakao', { session: false, failureRedirect: `${FRONTEND}/login` }),
     oauthCallback('kakao'));
 
 // Google
-router.get('/google', passport.authenticate('google', { scope: ['profile', 'email'] }));
+router.get('/google', startOAuth('google', { scope: ['profile', 'email'] }));
 router.get('/google/callback',
     passport.authenticate('google', { session: false, failureRedirect: `${FRONTEND}/login` }),
     oauthCallback('google'));
 
 // Naver
-router.get('/naver', passport.authenticate('naver'));
+router.get('/naver', startOAuth('naver'));
 router.get('/naver/callback',
     passport.authenticate('naver', { session: false, failureRedirect: `${FRONTEND}/login` }),
     oauthCallback('naver'));
@@ -706,7 +1018,7 @@ router.get('/me', async (req, res) => {
     }
 });
 
-router.post('/me/phone', async (req, res) => {
+async function completePassVerification(req, res, { requireBirthDate = false, updateAdultFields = false } = {}) {
     try {
         const user = await resolveSessionUser(req);
         const token = String(req.body?.verificationToken || '').trim();
@@ -715,14 +1027,14 @@ router.post('/me/phone', async (req, res) => {
         }
 
         const payload = verifyPhoneVerificationToken(token);
-        if (payload.purpose !== 'identity' && payload.purpose !== 'topup') {
-            return res.status(400).json({ error: '본인인증용 인증만 사용할 수 있습니다.' });
+        if (!['identity', 'adult', 'topup'].includes(payload.purpose)) {
+            return res.status(400).json({ error: 'PASS 인증용 인증만 사용할 수 있습니다.' });
         }
         const [verificationRows] = await pool.query(
             `
-            SELECT id, phone_number AS phoneNumber, purpose, verified_at AS verifiedAt, used_at AS usedAt
+            SELECT id, phone_number AS phoneNumber, provider, purpose, verified_at AS verifiedAt, used_at AS usedAt
             FROM phone_verifications
-            WHERE id=? AND phone_number=? AND purpose=?
+            WHERE id=? AND phone_number=? AND provider='pass' AND purpose=?
             LIMIT 1
             `,
             [payload.verificationId, payload.phoneNumber, payload.purpose]
@@ -742,7 +1054,7 @@ router.post('/me/phone', async (req, res) => {
         await pool.query(
             `
             UPDATE users
-            SET phone_number=?, phone_verified_at=NOW()
+            SET phone_number=?, phone_verified_at=NOW(), pass_verified_at=NOW(), adult_verified_at=NOW(), is_adult=1
             WHERE id=?
             `,
             [payload.phoneNumber, user.id]
@@ -756,6 +1068,9 @@ router.post('/me/phone', async (req, res) => {
             ...user,
             phone_number: payload.phoneNumber,
             phone_verified_at: new Date().toISOString(),
+            pass_verified_at: new Date().toISOString(),
+            adult_verified_at: new Date().toISOString(),
+            is_adult: true,
         };
 
         res.json({
@@ -763,8 +1078,16 @@ router.post('/me/phone', async (req, res) => {
             user: buildAuthUserPayload(updatedUser),
         });
     } catch (err) {
-        res.status(err.status || 401).json({ error: err.message || '본인인증에 실패했습니다.' });
+        res.status(err.status || 401).json({ error: err.message || 'PASS 인증에 실패했습니다.' });
     }
+}
+
+router.post('/me/phone', async (req, res) => {
+    return completePassVerification(req, res);
+});
+
+router.post('/me/pass', async (req, res) => {
+    return completePassVerification(req, res);
 });
 
 router.post('/me/adult', async (req, res) => {
@@ -779,16 +1102,10 @@ router.post('/me/adult', async (req, res) => {
         if (!birthDate) {
             return res.status(400).json({ error: '생년월일을 입력해주세요.' });
         }
-        if (!user.phone_verified_at) {
-            return res.status(403).json({ error: '성인인증 전에 본인인증이 필요합니다.' });
-        }
 
         const payload = verifyPhoneVerificationToken(token);
-        if (payload.purpose !== 'adult' && payload.purpose !== 'identity') {
-            return res.status(400).json({ error: '성인인증용 인증만 사용할 수 있습니다.' });
-        }
-        if (payload.phoneNumber !== user.phone_number) {
-            return res.status(400).json({ error: '인증된 휴대폰 번호가 일치하지 않습니다.' });
+        if (!['adult', 'identity', 'topup'].includes(payload.purpose)) {
+            return res.status(400).json({ error: 'PASS 성인인증용 인증만 사용할 수 있습니다.' });
         }
         if (!isAdultBirthDate(birthDate)) {
             return res.status(400).json({ error: '성인만 인증할 수 있습니다.' });
@@ -796,9 +1113,9 @@ router.post('/me/adult', async (req, res) => {
 
         const [verificationRows] = await pool.query(
             `
-            SELECT id, used_at AS usedAt
+            SELECT id, phone_number AS phoneNumber, provider, used_at AS usedAt
             FROM phone_verifications
-            WHERE id=? AND phone_number=? AND purpose=?
+            WHERE id=? AND phone_number=? AND provider='pass' AND purpose=?
             LIMIT 1
             `,
             [payload.verificationId, payload.phoneNumber, payload.purpose]
@@ -810,10 +1127,10 @@ router.post('/me/adult', async (req, res) => {
         await pool.query(
             `
             UPDATE users
-            SET birth_date=?, is_adult=1, adult_verified_at=NOW()
+            SET phone_number=?, phone_verified_at=NOW(), birth_date=?, is_adult=1, adult_verified_at=NOW(), pass_verified_at=NOW()
             WHERE id=?
             `,
-            [birthDate, user.id]
+            [payload.phoneNumber, birthDate, user.id]
         );
         await pool.query(
             'UPDATE phone_verifications SET used_at=NOW() WHERE id=?',
@@ -825,14 +1142,17 @@ router.post('/me/adult', async (req, res) => {
             user: {
                 ...buildAuthUserPayload({
                     ...user,
+                    phone_number: payload.phoneNumber,
+                    phone_verified_at: new Date().toISOString(),
                     birth_date: birthDate,
                     is_adult: true,
                     adult_verified_at: new Date().toISOString(),
+                    pass_verified_at: new Date().toISOString(),
                 }),
             },
         });
     } catch (err) {
-        res.status(err.status || 401).json({ error: err.message || '성인인증에 실패했습니다.' });
+        res.status(err.status || 401).json({ error: err.message || 'PASS 성인인증에 실패했습니다.' });
     }
 });
 
@@ -843,7 +1163,7 @@ router.get('/users', async (req, res) => {
         if (me.role !== 'admin') return res.status(403).json({ error: '관리자 권한 필요' });
 
         try {
-            const [rows] = await pool.query('SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, phone_number AS phoneNumber, phone_verified_at AS phoneVerifiedAt, adult_verified_at AS adultVerifiedAt, birth_date AS birthDate, point_balance AS pointBalance, created_at AS createdAt FROM users ORDER BY id DESC');
+            const [rows] = await pool.query('SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, phone_number AS phoneNumber, phone_verified_at AS phoneVerifiedAt, pass_verified_at AS passVerifiedAt, adult_verified_at AS adultVerifiedAt, birth_date AS birthDate, point_balance AS pointBalance, created_at AS createdAt FROM users ORDER BY id DESC');
             res.json(rows);
         } catch (dbErr) {
             console.error('Error fetching users:', dbErr);

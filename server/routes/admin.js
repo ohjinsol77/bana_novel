@@ -1,6 +1,6 @@
 import express from 'express';
 import pool from '../db.js';
-import { adjustUserPointBalance, getChatPointCostForUser, getStoryLimitForUser } from '../db.js';
+import { adjustUserPointBalance, getChatPointCostForUser, getPointSettings, getStoryLimitForUser, savePointSettings } from '../db.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -283,6 +283,7 @@ async function loadPointUserDetail(userId) {
                 can_publish_community AS canPublishCommunity,
                 phone_number AS phoneNumber,
                 phone_verified_at AS phoneVerifiedAt,
+                pass_verified_at AS passVerifiedAt,
                 adult_verified_at AS adultVerifiedAt,
                 birth_date AS birthDate,
                 point_balance AS pointBalance,
@@ -383,6 +384,7 @@ async function buildPointDashboard() {
 
         const summaryRow = summaryRows[0] || {};
         return {
+            pointSettings: getPointSettings(),
             summary: {
                 userCount: toNumber(summaryRow.userCount),
                 premiumUserCount: toNumber(summaryRow.premiumUserCount),
@@ -481,7 +483,7 @@ async function refreshDashboard(res, query = {}) {
     };
 
     const [users] = await pool.query(`
-        SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, phone_number AS phoneNumber, phone_verified_at AS phoneVerifiedAt, adult_verified_at AS adultVerifiedAt, birth_date AS birthDate, point_balance AS pointBalance, created_at AS createdAt
+        SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, phone_number AS phoneNumber, phone_verified_at AS phoneVerifiedAt, pass_verified_at AS passVerifiedAt, adult_verified_at AS adultVerifiedAt, birth_date AS birthDate, point_balance AS pointBalance, created_at AS createdAt
         FROM users
         ORDER BY created_at DESC, id DESC
     `);
@@ -1013,6 +1015,38 @@ router.get('/points/dashboard', auth, requireAdmin, async (_req, res) => {
     } catch (err) {
         console.error('Error loading admin point dashboard:', err);
         res.status(500).json({ error: '포인트 대시보드를 불러올 수 없습니다.' });
+    }
+});
+
+router.put('/points/settings', auth, requireAdmin, async (req, res) => {
+    const nextSettings = req.body?.pointSettings || req.body || {};
+    const chatPointCost = Math.trunc(Number(nextSettings.chatPointCost ?? nextSettings.chat_point_cost));
+    const premiumChatPointCost = Math.trunc(Number(nextSettings.premiumChatPointCost ?? nextSettings.premium_chat_point_cost));
+    const bindingPointCostPerPage = Math.trunc(Number(nextSettings.bindingPointCostPerPage ?? nextSettings.binding_point_cost_per_page));
+
+    if (![chatPointCost, premiumChatPointCost, bindingPointCostPerPage].every((value) => Number.isInteger(value) && value >= 0)) {
+        return res.status(400).json({ error: '포인트 수치는 0 이상의 정수로 입력해주세요.' });
+    }
+
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        const saved = await savePointSettings(conn, {
+            chatPointCost,
+            premiumChatPointCost,
+            bindingPointCostPerPage,
+        });
+        await conn.commit();
+        return res.json({
+            ok: true,
+            pointSettings: saved,
+        });
+    } catch (err) {
+        await conn.rollback();
+        console.error('Error updating admin point settings:', err);
+        return res.status(500).json({ error: '포인트 설정을 저장할 수 없습니다.' });
+    } finally {
+        conn.release();
     }
 });
 
