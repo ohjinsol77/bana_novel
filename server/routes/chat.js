@@ -72,6 +72,58 @@ router.get('/:storyId', auth, async (req, res) => {
     }
 });
 
+// AI가 작성한 메시지 수정
+router.put('/:storyId/messages/:messageId', auth, async (req, res) => {
+    try {
+        const storyId = Number(req.params.storyId);
+        const messageId = Number(req.params.messageId);
+        const content = String(req.body?.content || '').trim();
+
+        if (!storyId || !messageId) {
+            return res.status(400).json({ error: '잘못된 요청입니다.' });
+        }
+
+        if (!content) {
+            return res.status(400).json({ error: '수정할 내용을 입력해주세요.' });
+        }
+
+        const [storyRows] = await pool.query(
+            'SELECT id FROM stories WHERE id=? AND user_id=? LIMIT 1',
+            [storyId, req.user.id]
+        );
+        if (!storyRows.length) {
+            return res.status(403).json({ error: '권한이 없습니다.' });
+        }
+
+        const [messageRows] = await pool.query(
+            'SELECT id, role FROM story_messages WHERE id=? AND story_id=? AND user_id=? LIMIT 1',
+            [messageId, storyId, req.user.id]
+        );
+        if (!messageRows.length) {
+            return res.status(404).json({ error: '메시지를 찾을 수 없습니다.' });
+        }
+
+        if (messageRows[0].role !== 'assistant') {
+            return res.status(403).json({ error: 'AI가 작성한 글만 수정할 수 있습니다.' });
+        }
+
+        await pool.query(
+            'UPDATE story_messages SET content=? WHERE id=? AND story_id=? AND user_id=? AND role=\'assistant\'',
+            [content, messageId, storyId, req.user.id]
+        );
+
+        const [updatedRows] = await pool.query(
+            'SELECT id, story_id, user_id, role, content, created_at FROM story_messages WHERE id=? AND story_id=? AND user_id=? LIMIT 1',
+            [messageId, storyId, req.user.id]
+        );
+
+        res.json(updatedRows[0] || { ok: true });
+    } catch (err) {
+        console.error('Error updating story message:', err);
+        res.status(500).json({ error: '메시지 수정에 실패했습니다.' });
+    }
+});
+
 // 스토리 한 단락 쓰기(유저) + AI 작가 생성
 router.post('/:storyId', auth, async (req, res) => {
     const conn = await pool.getConnection();
@@ -415,6 +467,7 @@ router.delete('/:storyId/clear', auth, async (req, res) => {
 function buildWriterPrompt(story, characters) {
     let prompt = `당신은 뛰어난 웹소설의 공동 작가입니다. 직전 입력을 바탕으로, 아래에 주어진 <배경 세계관>과 <등장인물 설정>을 완벽하게 반영해 이야기의 **다음 장면(상황 묘사, 대화 등)**을 소설체로 길고 생생하게 작성하세요.
 등장인물 설정은 모두 이야기 속 인물들의 성격, 관계, 역할을 뜻합니다. 이 정보는 소설 속 장면을 자연스럽게 이어 쓰는 데만 사용하세요.
+등장인물 설정은 내부적으로 영어 키워드와 압축된 메타데이터로 전달될 수 있지만, 사용자 고유의 이름, 배경, 메모는 원문 그대로 해석하세요.
 
 <소설 배경 및 세계관>
 제목: ${story.title}
@@ -441,7 +494,7 @@ function buildWriterPrompt(story, characters) {
 <집필 규칙>
 1. 직전 입력은 장면 지시로 받아들이고, 그 흐름을 자연스럽게 이어서 흥미진진하게 전개하세요.
 2. 각 캐릭터의 성격, 이야기 속 관계, 말투를 일관성 있게 묘사하세요. 독자나 작가와의 관계는 절대 언급하지 마세요. 여러 캐릭터가 동시에 대화하거나 얽히는 장면을 적극적으로 묘사하세요.
-3. 한국어 웹소설 문체를 사용하세요. 지문과 대화를 적절히 분배하세요.
+3. 반드시 한국어로만 웹소설 문체를 사용하세요. 지문과 대화를 적절히 분배하세요.
 4. AI임을 암시하는 말("네, 이어서 작성하겠습니다" 등)은 절대 출력하지 말고 바로 소설 본문만 작성하세요.
 5. 분량은 적절히(한국어 약 1000자~1500자 내외) 조절하여, 글이 도중에 잘리지 않도록 반드시 완전한 문장(마침표, 따옴표 등)으로 끝맺으세요.`;
 

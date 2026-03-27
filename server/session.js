@@ -18,11 +18,16 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
             id: 1,
             name: '애플 관리자',
             email: 'admin@novelai.com',
+            provider: 'local',
             role: 'admin',
             is_adult: true,
             is_premium: true,
             is_suspended: false,
             can_publish_community: true,
+            phone_number: null,
+            phone_verified_at: null,
+            adult_verified_at: null,
+            birth_date: null,
             point_balance: 0,
         };
         return {
@@ -38,11 +43,16 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
                 id: 1,
                 name: '손님',
                 email: '',
+                provider: 'local',
                 role: 'admin',
                 is_adult: false,
                 is_premium: false,
                 is_suspended: false,
                 can_publish_community: false,
+                phone_number: null,
+                phone_verified_at: null,
+                adult_verified_at: null,
+                birth_date: null,
                 point_balance: 0,
             };
             return {
@@ -62,7 +72,7 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
     }
 
     const [rows] = await pool.query(
-        'SELECT id, name, email, role, is_adult, is_premium, is_suspended, can_publish_community, point_balance FROM users WHERE id=? LIMIT 1',
+        'SELECT id, name, email, provider, role, is_adult, is_premium, is_suspended, can_publish_community, phone_number, phone_verified_at, adult_verified_at, birth_date, point_balance FROM users WHERE id=? LIMIT 1',
         [payload.id]
     );
 
@@ -79,11 +89,16 @@ export async function resolveSessionUser(req, { allowGuestAdmin = false } = {}) 
         id: user.id,
         name: user.name,
         email: user.email,
+        provider: user.provider,
         role: user.role,
         is_adult: Boolean(user.is_adult),
         is_premium: Boolean(user.is_premium),
         is_suspended: Boolean(user.is_suspended),
         can_publish_community: Boolean(user.can_publish_community),
+        phone_number: user.phone_number || null,
+        phone_verified_at: user.phone_verified_at || null,
+        adult_verified_at: user.adult_verified_at || null,
+        birth_date: user.birth_date || null,
         point_balance: Number(user.point_balance) || 0,
     };
 

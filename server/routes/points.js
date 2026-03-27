@@ -28,8 +28,8 @@ function toNumber(value, fallback = 0) {
     return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-async function loadRecentTransactions(userId, limit = 20) {
-    const [rows] = await pool.query(
+async function loadRecentTransactions(userId, limit = 20, conn = pool) {
+    const [rows] = await conn.query(
         `
         SELECT
             id,
@@ -60,8 +60,10 @@ async function loadRecentTransactions(userId, limit = 20) {
 }
 
 router.get('/me', auth, async (req, res) => {
+    const conn = await pool.getConnection();
     try {
-        const [rows] = await pool.query(
+        await conn.beginTransaction();
+        const [rows] = await conn.query(
             'SELECT point_balance AS pointBalance, is_premium AS isPremium, role FROM users WHERE id=? LIMIT 1',
             [req.user.id]
         );
@@ -72,21 +74,29 @@ router.get('/me', auth, async (req, res) => {
         const pointBalance = toNumber(rows[0].pointBalance, 0);
         const chatCost = getChatPointCostForUser(req.user);
         const storyLimit = getStoryLimitForUser(req.user);
-        const [storyRows] = await pool.query('SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?', [req.user.id]);
+        const [storyRows] = await conn.query('SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?', [req.user.id]);
         const storyCount = toNumber(storyRows[0]?.storyCount, 0);
+        const recentTransactions = await loadRecentTransactions(req.user.id, 20, conn);
+
+        await conn.commit();
 
         res.json({
             pointBalance,
             chatCost,
             storyLimit,
             storyCount,
-            canCharge: true,
+            canCharge: Boolean(req.user.phone_verified_at || req.user.role === 'admin'),
+            identityVerified: Boolean(req.user.phone_verified_at),
+            adultVerified: Boolean(req.user.adult_verified_at),
             topUpOptions: POINT_TOP_UP_OPTIONS,
-            recentTransactions: await loadRecentTransactions(req.user.id, 20),
+            recentTransactions,
         });
     } catch (err) {
+        await conn.rollback();
         console.error('Error loading my points:', err);
         res.status(500).json({ error: '포인트 정보를 불러올 수 없습니다.' });
+    } finally {
+        conn.release();
     }
 });
 
@@ -103,6 +113,12 @@ router.post('/topup', auth, async (req, res) => {
     const conn = await pool.getConnection();
     try {
         await conn.beginTransaction();
+        if (req.user.role !== 'admin' && !req.user.phone_verified_at) {
+            const error = new Error('포인트 충전 전 본인인증이 필요합니다.');
+            error.status = 403;
+            error.code = 'PHONE_VERIFICATION_REQUIRED';
+            throw error;
+        }
         const pointResult = await adjustUserPointBalance(conn, {
             userId: req.user.id,
             amount,
@@ -132,8 +148,10 @@ router.post('/topup', auth, async (req, res) => {
 });
 
 router.get('/admin/dashboard', auth, requireAdmin, async (req, res) => {
+    const conn = await pool.getConnection();
     try {
-        const [summaryRows] = await pool.query(`
+        await conn.beginTransaction();
+        const [summaryRows] = await conn.query(`
             SELECT
                 (SELECT COUNT(*) FROM users) AS userCount,
                 (SELECT COUNT(*) FROM users WHERE is_premium=1) AS premiumUserCount,
@@ -144,6 +162,7 @@ router.get('/admin/dashboard', auth, requireAdmin, async (req, res) => {
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'welcome' THEN amount ELSE 0 END), 0) FROM point_transactions) AS welcomeGranted,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'topup' THEN amount ELSE 0 END), 0) FROM point_transactions) AS totalTopup,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'chat' AND amount < 0 THEN -amount ELSE 0 END), 0) FROM point_transactions) AS chatSpent,
+                (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'binding' AND amount < 0 THEN -amount ELSE 0 END), 0) FROM point_transactions) AS bindingSpent,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'admin_grant' THEN amount ELSE 0 END), 0) FROM point_transactions) AS adminGranted,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'admin_deduct' THEN -amount ELSE 0 END), 0) FROM point_transactions) AS adminDeducted,
                 (SELECT COUNT(*) FROM point_transactions) AS transactionCount,
@@ -151,7 +170,7 @@ router.get('/admin/dashboard', auth, requireAdmin, async (req, res) => {
                 (SELECT COALESCE(SUM(amount), 0) FROM point_transactions WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS net24h
         `);
 
-        const [ledgerRows] = await pool.query(`
+        const [ledgerRows] = await conn.query(`
             SELECT
                 p.id,
                 p.user_id AS userId,
@@ -173,13 +192,14 @@ router.get('/admin/dashboard', auth, requireAdmin, async (req, res) => {
             LIMIT 150
         `);
 
-        const [topUsers] = await pool.query(`
+        const [topUsers] = await conn.query(`
             SELECT id, name, email, role, is_premium AS isPremium, point_balance AS pointBalance, created_at AS createdAt
             FROM users
             ORDER BY point_balance DESC, id DESC
             LIMIT 50
         `);
 
+        await conn.commit();
         res.json({
             summary: {
                 userCount: toNumber(summaryRows[0]?.userCount),
@@ -191,6 +211,7 @@ router.get('/admin/dashboard', auth, requireAdmin, async (req, res) => {
                 welcomeGranted: toNumber(summaryRows[0]?.welcomeGranted),
                 totalTopup: toNumber(summaryRows[0]?.totalTopup),
                 chatSpent: toNumber(summaryRows[0]?.chatSpent),
+                bindingSpent: toNumber(summaryRows[0]?.bindingSpent),
                 adminGranted: toNumber(summaryRows[0]?.adminGranted),
                 adminDeducted: toNumber(summaryRows[0]?.adminDeducted),
                 transactionCount: toNumber(summaryRows[0]?.transactionCount),
@@ -201,15 +222,20 @@ router.get('/admin/dashboard', auth, requireAdmin, async (req, res) => {
             topUsers,
         });
     } catch (err) {
+        await conn.rollback();
         console.error('Error loading point dashboard:', err);
         res.status(500).json({ error: '포인트 대시보드를 불러올 수 없습니다.' });
+    } finally {
+        conn.release();
     }
 });
 
 router.get('/admin/users/:id', auth, requireAdmin, async (req, res) => {
+    const conn = await pool.getConnection();
     try {
+        await conn.beginTransaction();
         const userId = req.params.id;
-        const [userRows] = await pool.query(
+        const [userRows] = await conn.query(
             `
             SELECT
                 id, name, email, role, provider,
@@ -217,6 +243,10 @@ router.get('/admin/users/:id', auth, requireAdmin, async (req, res) => {
                 is_premium AS isPremium,
                 is_suspended AS isSuspended,
                 can_publish_community AS canPublishCommunity,
+                phone_number AS phoneNumber,
+                phone_verified_at AS phoneVerifiedAt,
+                adult_verified_at AS adultVerifiedAt,
+                birth_date AS birthDate,
                 point_balance AS pointBalance,
                 created_at AS createdAt
             FROM users
@@ -229,10 +259,12 @@ router.get('/admin/users/:id', auth, requireAdmin, async (req, res) => {
             return res.status(404).json({ error: '회원을 찾을 수 없습니다.' });
         }
 
-        const [storyRows] = await pool.query(
+        const [storyRows] = await conn.query(
             'SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?',
             [userId]
         );
+        const recentTransactions = await loadRecentTransactions(userId, 20, conn);
+        await conn.commit();
 
         res.json({
             user: {
@@ -240,11 +272,14 @@ router.get('/admin/users/:id', auth, requireAdmin, async (req, res) => {
                 pointBalance: toNumber(userRows[0].pointBalance, 0),
             },
             storyCount: toNumber(storyRows[0]?.storyCount, 0),
-            recentTransactions: await loadRecentTransactions(userId, 20),
+            recentTransactions,
         });
     } catch (err) {
+        await conn.rollback();
         console.error('Error loading point user detail:', err);
         res.status(500).json({ error: '회원 포인트 정보를 불러올 수 없습니다.' });
+    } finally {
+        conn.release();
     }
 });
 

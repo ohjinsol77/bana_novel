@@ -1,8 +1,9 @@
 import express from 'express';
 import pool from '../db.js';
-import { getStoryLimitForUser } from '../db.js';
+import { adjustUserPointBalance, getStoryLimitForUser } from '../db.js';
 import { hydrateCharacterRow, serializeCharacterPayload } from '../persona.js';
 import { resolveSessionUser } from '../session.js';
+import { buildBindingPages, normalizeBindingOptions } from '../../shared/binding-layout.js';
 
 const router = express.Router();
 
@@ -151,6 +152,219 @@ async function updateStorySettingsHandler(req, res) {
         res.status(500).json({ error: '설정 저장 실패: ' + err.message });
     }
 }
+
+async function loadBindingExportContext(conn, storyId, userId, bindingOptions) {
+    const [storyRows] = await conn.query(
+        `SELECT id, user_id, title, background, environment, cover_image_url, created_at, viewer_settings
+         FROM stories
+         WHERE id=? AND user_id=?
+         LIMIT 1`,
+        [storyId, userId]
+    );
+    if (!storyRows.length) {
+        return null;
+    }
+
+    const story = storyRows[0];
+    const viewerSettings = parseJsonField(story.viewer_settings, null) || {};
+
+    const [messageRows] = await conn.query(
+        `SELECT id, role, content, created_at
+         FROM story_messages
+         WHERE story_id=? AND user_id=?
+         ORDER BY created_at ASC, id ASC`,
+        [storyId, userId]
+    );
+
+    if (!messageRows.length) {
+        return {
+            story,
+            viewerSettings,
+            messageRows,
+            pages: [],
+            pageCount: 0,
+            cost: 0,
+            currentBalance: 0,
+        };
+    }
+
+    const pages = buildBindingPages({
+        title: story.title || '',
+        background: story.background || '',
+        environment: story.environment || '',
+        messages: messageRows,
+        viewerSettings,
+        options: bindingOptions,
+    });
+    const pageCount = pages.length;
+    const cost = pageCount;
+
+    const [balanceRows] = await conn.query(
+        'SELECT point_balance AS pointBalance FROM users WHERE id=? LIMIT 1',
+        [userId]
+    );
+    const currentBalance = Number(balanceRows[0]?.pointBalance ?? 0);
+
+    return {
+        story,
+        viewerSettings,
+        messageRows,
+        pages,
+        pageCount,
+        cost,
+        currentBalance,
+    };
+}
+
+router.post('/:id/binding/prepare', auth, async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const storyId = Number(req.params.id);
+        if (!storyId) {
+            return res.status(400).json({ error: '잘못된 요청입니다.' });
+        }
+
+        await conn.beginTransaction();
+
+        const bindingOptions = normalizeBindingOptions(req.body?.options || {});
+        if (bindingOptions.includeAuthorNote && !bindingOptions.authorNoteText) {
+            await conn.rollback();
+            return res.status(400).json({ error: '작가의 말을 입력해주세요.' });
+        }
+
+        const context = await loadBindingExportContext(conn, storyId, req.user.id, bindingOptions);
+        if (!context) {
+            await conn.rollback();
+            return res.status(404).json({ error: '이야기를 찾을 수 없습니다.' });
+        }
+
+        if (!context.messageRows.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: '제본할 내용이 없습니다.' });
+        }
+
+        if (!context.pages.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: '출력할 페이지가 없습니다.' });
+        }
+
+        if (context.currentBalance < context.cost) {
+            await conn.rollback();
+            return res.status(402).json({
+                error: '제본을 위한 포인트가 부족합니다. 충전 후 다시 시도해주세요.',
+                code: 'INSUFFICIENT_POINTS',
+                requiredPoints: context.cost,
+                pointBalance: context.currentBalance,
+            });
+        }
+
+        await conn.commit();
+
+        res.json({
+            ok: true,
+            pageCount: context.pageCount,
+            cost: context.cost,
+            remainingPoints: context.currentBalance,
+            binding: {
+                storyId: context.story.id,
+                title: context.story.title,
+                background: context.story.background || '',
+                environment: context.story.environment || '',
+                coverImageUrl: context.story.cover_image_url || null,
+                authorName: req.user.name || null,
+                createdAt: context.story.created_at || null,
+                viewerSettings: context.viewerSettings,
+                options: bindingOptions,
+                messages: context.messageRows,
+                pageCount: context.pageCount,
+                cost: context.cost,
+                pages: context.pages,
+            },
+        });
+    } catch (err) {
+        try {
+            await conn.rollback();
+        } catch {
+            // ignore rollback errors
+        }
+        console.error('Error preparing binding export:', err);
+        res.status(500).json({ error: '제본용 페이지 준비에 실패했습니다.' });
+    } finally {
+        conn.release();
+    }
+});
+
+router.post('/:id/binding/complete', auth, async (req, res) => {
+    const conn = await pool.getConnection();
+    try {
+        const storyId = Number(req.params.id);
+        if (!storyId) {
+            return res.status(400).json({ error: '잘못된 요청입니다.' });
+        }
+
+        await conn.beginTransaction();
+
+        const bindingOptions = normalizeBindingOptions(req.body?.options || {});
+        if (bindingOptions.includeAuthorNote && !bindingOptions.authorNoteText) {
+            await conn.rollback();
+            return res.status(400).json({ error: '작가의 말을 입력해주세요.' });
+        }
+
+        const context = await loadBindingExportContext(conn, storyId, req.user.id, bindingOptions);
+        if (!context) {
+            await conn.rollback();
+            return res.status(404).json({ error: '이야기를 찾을 수 없습니다.' });
+        }
+
+        if (!context.messageRows.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: '제본할 내용이 없습니다.' });
+        }
+
+        if (!context.pages.length) {
+            await conn.rollback();
+            return res.status(400).json({ error: '출력할 페이지가 없습니다.' });
+        }
+
+        if (context.currentBalance < context.cost) {
+            await conn.rollback();
+            return res.status(402).json({
+                error: '제본을 위한 포인트가 부족합니다. 충전 후 다시 시도해주세요.',
+                code: 'INSUFFICIENT_POINTS',
+                requiredPoints: context.cost,
+                pointBalance: context.currentBalance,
+            });
+        }
+
+        const pointResult = await adjustUserPointBalance(conn, {
+            userId: req.user.id,
+            amount: -context.cost,
+            transactionType: 'binding',
+            note: `제본 출력 (${context.cost}P)`,
+            referenceType: 'story',
+            referenceId: storyId,
+        });
+
+        await conn.commit();
+
+        res.json({
+            ok: true,
+            pageCount: context.pageCount,
+            cost: context.cost,
+            remainingPoints: pointResult.afterBalance,
+        });
+    } catch (err) {
+        try {
+            await conn.rollback();
+        } catch {
+            // ignore rollback errors
+        }
+        console.error('Error finalizing binding export:', err);
+        res.status(500).json({ error: '제본 포인트 차감에 실패했습니다.' });
+    } finally {
+        conn.release();
+    }
+});
 
 // ── 내 이야기 목록 조회 ─────────────────────────────────────
 router.get('/', auth, async (req, res) => {

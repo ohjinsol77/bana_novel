@@ -24,6 +24,7 @@ export const PREMIUM_STORY_LIMIT = 30;
 export const NORMAL_CHAT_POINT_COST = 15;
 export const PREMIUM_CHAT_POINT_COST = 10;
 export const POINT_TOP_UP_OPTIONS = [50, 100, 300, 500, 1000];
+export const PHONE_VERIFICATION_CODE_TTL_MINUTES = 10;
 
 function createAppError(message, status = 400, code = 'APP_ERROR', extra = {}) {
     const error = new Error(message);
@@ -39,7 +40,6 @@ export function getStoryLimitForUser(user) {
 }
 
 export function getChatPointCostForUser(user) {
-    if (user?.role === 'admin') return 0;
     return user?.is_premium ? PREMIUM_CHAT_POINT_COST : NORMAL_CHAT_POINT_COST;
 }
 
@@ -314,6 +314,66 @@ export async function initDB() {
             await conn.query('ALTER TABLE users ADD COLUMN can_publish_community TINYINT(1) DEFAULT 0 AFTER is_suspended;');
         }
 
+        const [passwordHashColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'password_hash'
+            LIMIT 1
+        `);
+        if (!passwordHashColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN password_hash VARCHAR(255) NULL AFTER profile_img;');
+        }
+
+        const [phoneNumberColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'phone_number'
+            LIMIT 1
+        `);
+        if (!phoneNumberColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN phone_number VARCHAR(30) NULL AFTER password_hash;');
+        }
+
+        const [phoneVerifiedAtColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'phone_verified_at'
+            LIMIT 1
+        `);
+        if (!phoneVerifiedAtColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN phone_verified_at DATETIME NULL AFTER phone_number;');
+        }
+
+        const [adultVerifiedAtColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'adult_verified_at'
+            LIMIT 1
+        `);
+        if (!adultVerifiedAtColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN adult_verified_at DATETIME NULL AFTER phone_verified_at;');
+        }
+
+        const [birthDateColumns] = await conn.query(`
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE()
+              AND table_name = 'users'
+              AND column_name = 'birth_date'
+            LIMIT 1
+        `);
+        if (!birthDateColumns.length) {
+            await conn.query('ALTER TABLE users ADD COLUMN birth_date DATE NULL AFTER adult_verified_at;');
+        }
+
         const [pointBalanceColumns] = await conn.query(`
             SELECT column_name
             FROM information_schema.columns
@@ -340,7 +400,7 @@ export async function initDB() {
                 user_id         INT NOT NULL,
                 amount          INT NOT NULL,
                 balance_after   INT NOT NULL,
-                transaction_type ENUM('welcome','topup','chat','admin_grant','admin_deduct','refund','adjustment') NOT NULL,
+                transaction_type ENUM('welcome','topup','chat','binding','admin_grant','admin_deduct','refund','adjustment') NOT NULL,
                 note            VARCHAR(255) NULL,
                 reference_type  VARCHAR(50) NULL,
                 reference_id    INT NULL,
@@ -350,6 +410,24 @@ export async function initDB() {
                 INDEX idx_point_transactions_type_created (transaction_type, created_at),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        `);
+
+        await conn.query(`
+            CREATE TABLE IF NOT EXISTS phone_verifications (
+                id              INT AUTO_INCREMENT PRIMARY KEY,
+                phone_number    VARCHAR(30) NOT NULL,
+                purpose         ENUM('signup','identity','adult','topup') NOT NULL,
+                code_hash       VARCHAR(255) NOT NULL,
+                attempt_count   INT NOT NULL DEFAULT 0,
+                expires_at      DATETIME NOT NULL,
+                verified_at     DATETIME NULL,
+                used_at         DATETIME NULL,
+                created_for_user_id INT NULL,
+                created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_phone_verifications_phone_purpose_created (phone_number, purpose, created_at),
+                INDEX idx_phone_verifications_expires (expires_at),
+                FOREIGN KEY (created_for_user_id) REFERENCES users(id) ON DELETE SET NULL
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         `);
 
@@ -368,6 +446,11 @@ export async function initDB() {
         if (!pointTypeCreatedIndex.length) {
             await conn.query('CREATE INDEX idx_point_transactions_type_created ON point_transactions (transaction_type, created_at);');
         }
+
+        await conn.query(`
+            ALTER TABLE point_transactions
+            MODIFY COLUMN transaction_type ENUM('welcome','topup','chat','binding','admin_grant','admin_deduct','refund','adjustment') NOT NULL
+        `);
 
         const [legacyCharacters] = await conn.query(`
             SELECT id, name, personality, appearance, habits

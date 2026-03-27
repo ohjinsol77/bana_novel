@@ -7,6 +7,11 @@ CREATE TABLE IF NOT EXISTS users (
     name        VARCHAR(100),
     email       VARCHAR(255),
     profile_img VARCHAR(512),
+    password_hash VARCHAR(255) NULL,
+    phone_number VARCHAR(30) NULL,
+    phone_verified_at DATETIME NULL,
+    adult_verified_at DATETIME NULL,
+    birth_date DATE NULL,
     role        ENUM('user','admin') DEFAULT 'user',
     is_adult    TINYINT(1) DEFAULT 0,
     is_premium  TINYINT(1) DEFAULT 0,
@@ -72,7 +77,7 @@ CREATE TABLE IF NOT EXISTS point_transactions (
     user_id         INT NOT NULL,
     amount          INT NOT NULL,
     balance_after   INT NOT NULL,
-    transaction_type ENUM('welcome','topup','chat','admin_grant','admin_deduct','refund','adjustment') NOT NULL,
+    transaction_type ENUM('welcome','topup','chat','binding','admin_grant','admin_deduct','refund','adjustment') NOT NULL,
     note            VARCHAR(255) NULL,
     reference_type  VARCHAR(50) NULL,
     reference_id    INT NULL,
@@ -82,6 +87,22 @@ CREATE TABLE IF NOT EXISTS point_transactions (
     INDEX idx_point_transactions_type_created (transaction_type, created_at),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS phone_verifications (
+    id              INT AUTO_INCREMENT PRIMARY KEY,
+    phone_number    VARCHAR(30) NOT NULL,
+    purpose         ENUM('signup','identity','adult','topup') NOT NULL,
+    code_hash       VARCHAR(255) NOT NULL,
+    attempt_count   INT NOT NULL DEFAULT 0,
+    expires_at      DATETIME NOT NULL,
+    verified_at     DATETIME NULL,
+    used_at         DATETIME NULL,
+    created_for_user_id INT NULL,
+    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_phone_verifications_phone_purpose_created (phone_number, purpose, created_at),
+    INDEX idx_phone_verifications_expires (expires_at),
+    FOREIGN KEY (created_for_user_id) REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 관리자 계정 시드

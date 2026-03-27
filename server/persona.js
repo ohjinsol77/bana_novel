@@ -96,6 +96,100 @@ const OPTION_LOOKUPS = Object.fromEntries(
     Object.entries(PERSONA_OPTIONS).map(([key, options]) => [key, new Map(options.map((option) => [option.value, option.label]))])
 );
 
+const OPTION_LOOKUPS_EN = Object.fromEntries(
+    Object.entries({
+        gender: [
+            ['male', 'male'],
+            ['female', 'female'],
+            ['other', 'other'],
+        ],
+        personality: [
+            ['kind', 'kind'],
+            ['playful', 'playful'],
+            ['curious', 'curious'],
+            ['logical', 'logical'],
+            ['calm', 'calm'],
+            ['energetic', 'energetic'],
+            ['optimistic', 'optimistic'],
+            ['sarcastic', 'sarcastic'],
+            ['pragmatic', 'pragmatic'],
+            ['emotional', 'emotional'],
+            ['humorous', 'humorous'],
+            ['protective', 'protective'],
+            ['tsundere', 'tsundere'],
+            ['charismatic', 'charismatic'],
+            ['quirky', 'quirky'],
+            ['mysterious', 'mysterious'],
+            ['proactive', 'proactive'],
+            ['introverted', 'introverted'],
+            ['extroverted', 'extroverted'],
+            ['analytical', 'analytical'],
+        ],
+        speechStyles: [
+            ['formal', 'formal'],
+            ['casual', 'casual'],
+            ['friendly', 'friendly'],
+            ['calm_tone', 'calm tone'],
+            ['playful_tone', 'playful tone'],
+            ['direct', 'direct'],
+            ['gentle', 'gentle'],
+            ['explanatory', 'explanatory'],
+            ['short_sentences', 'short sentences'],
+            ['long_explanations', 'long explanations'],
+            ['emoji', 'emoji'],
+            ['asks_questions', 'asks questions'],
+        ],
+        behaviorRules: [
+            ['stay_positive', 'stay positive'],
+            ['show_empathy', 'show empathy'],
+            ['ask_questions', 'ask questions'],
+            ['keep_conversation', 'keep conversation going'],
+            ['use_humor', 'use humor'],
+            ['be_helpful', 'be helpful'],
+        ],
+        likes: [
+            ['games', 'games'],
+            ['anime', 'anime'],
+            ['movies', 'movies'],
+            ['music', 'music'],
+            ['sports', 'sports'],
+            ['travel', 'travel'],
+            ['food', 'food'],
+            ['books', 'books'],
+            ['technology', 'technology'],
+            ['fashion', 'fashion'],
+            ['photography', 'photography'],
+            ['animals', 'animals'],
+            ['cafes', 'cafes'],
+            ['late_night_chat', 'late-night chat'],
+            ['social_media', 'social media'],
+        ],
+        dislikes: [
+            ['rude_people', 'rude people'],
+            ['boring_conversation', 'boring conversation'],
+            ['lies', 'lies'],
+            ['loud_environment', 'loud environment'],
+            ['aggressive_language', 'aggressive language'],
+        ],
+        relationship: [
+            ['friend', 'friend'],
+            ['lover', 'lover'],
+            ['colleague', 'colleague'],
+            ['mentor', 'mentor'],
+            ['advisor', 'advisor'],
+            ['gaming_friend', 'gaming friend'],
+            ['guide', 'guide'],
+        ],
+        goals: [
+            ['build_friendship', 'build friendship'],
+            ['fun_conversation', 'fun conversation'],
+            ['provide_help', 'provide help'],
+            ['provide_information', 'provide information'],
+            ['emotional_support', 'emotional support'],
+        ],
+    }).map(([key, entries]) => [key, new Map(entries)])
+);
+
 function toTrimmedString(value) {
     return typeof value === 'string' ? value.trim() : '';
 }
@@ -237,26 +331,34 @@ function toDisplayText(values, lookupKey) {
     return labels.length ? labels.join(', ') : '미설정';
 }
 
+function toEnglishDisplayText(values, lookupKey) {
+    const labels = values
+        .map((value) => OPTION_LOOKUPS_EN[lookupKey].get(value))
+        .filter(Boolean);
+
+    return labels.length ? labels.join(', ') : 'unset';
+}
+
 export function formatCharacterPersona(character) {
-    const ageText = character.age === null ? '미설정' : `${character.age}세`;
-    const customBehaviorText = character.customBehaviorRules || '없음';
-    const customDislikesText = character.customDislikes || '없음';
-    const customGoalsText = character.customGoals || '없음';
+    const ageText = character.age === null ? 'unset' : `${character.age}`;
+    const customBehaviorText = character.customBehaviorRules || 'none';
+    const customDislikesText = character.customDislikes || 'none';
+    const customGoalsText = character.customGoals || 'none';
 
     return [
-        `[인물: ${character.name || '이름 미설정'}]`,
-        `- 기본 정보: 나이 ${ageText}, 성별 ${OPTION_LOOKUPS.gender.get(character.gender) || '기타'}, 직업 ${character.job || '미설정'}, 거주지 ${character.residence || '미설정'}`,
-        `- 주인공 여부: ${character.isProtagonist ? '주인공' : '조연/기타'}`,
-        `- 성격: ${toDisplayText(character.personality, 'personality')}`,
-        `- 말투: ${toDisplayText(character.speechStyles, 'speechStyles')}`,
-        `- 행동 성향: ${toDisplayText(character.behaviorRules, 'behaviorRules')}`,
-        `- 추가 메모: ${customBehaviorText}`,
-        `- 선호: ${toDisplayText(character.likes, 'likes')}`,
-        `- 비선호: ${toDisplayText(character.dislikes, 'dislikes')}`,
-        `- 비선호 추가 메모: ${customDislikesText}`,
-        `- 이야기 속 역할: ${OPTION_LOOKUPS.relationship.get(character.relationship) || '친구'}`,
-        `- 장면 목표: ${toDisplayText(character.goals, 'goals')}`,
-        `- 장면 목표 추가 메모: ${customGoalsText}`,
-        `- 캐릭터 개요: ${character.background || '미설정'}`,
+        `[Character: ${character.name || 'Unnamed'}]`,
+        `- Core: age ${ageText}, gender ${OPTION_LOOKUPS_EN.gender.get(character.gender) || 'other'}, job ${character.job || 'unset'}, residence ${character.residence || 'unset'}`,
+        `- Protagonist: ${character.isProtagonist ? 'yes' : 'no'}`,
+        `- Personality: ${toEnglishDisplayText(character.personality, 'personality')}`,
+        `- Speech style: ${toEnglishDisplayText(character.speechStyles, 'speechStyles')}`,
+        `- Behavior: ${toEnglishDisplayText(character.behaviorRules, 'behaviorRules')}`,
+        `- Custom behavior note: ${customBehaviorText}`,
+        `- Likes: ${toEnglishDisplayText(character.likes, 'likes')}`,
+        `- Dislikes: ${toEnglishDisplayText(character.dislikes, 'dislikes')}`,
+        `- Custom dislike note: ${customDislikesText}`,
+        `- Story role: ${OPTION_LOOKUPS_EN.relationship.get(character.relationship) || 'friend'}`,
+        `- Goals: ${toEnglishDisplayText(character.goals, 'goals')}`,
+        `- Custom goal note: ${customGoalsText}`,
+        `- Background: ${character.background || 'unset'}`,
     ].join('\n');
 }

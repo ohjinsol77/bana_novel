@@ -233,8 +233,8 @@ async function fetchRangeStats({ preset, start, end, granularity }) {
     };
 }
 
-async function loadPointTransactions(limit = 150) {
-    const [rows] = await pool.query(
+async function loadPointTransactions(limit = 150, conn = pool) {
+    const [rows] = await conn.query(
         `
         SELECT
             p.id,
@@ -269,8 +269,11 @@ async function loadPointTransactions(limit = 150) {
 }
 
 async function loadPointUserDetail(userId) {
-    const [userRows, storyRows, recentTransactions] = await Promise.all([
-        pool.query(
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+
+        const [userRows] = await conn.query(
             `
             SELECT
                 id, name, email, role, provider,
@@ -278,6 +281,10 @@ async function loadPointUserDetail(userId) {
                 is_premium AS isPremium,
                 is_suspended AS isSuspended,
                 can_publish_community AS canPublishCommunity,
+                phone_number AS phoneNumber,
+                phone_verified_at AS phoneVerifiedAt,
+                adult_verified_at AS adultVerifiedAt,
+                birth_date AS birthDate,
                 point_balance AS pointBalance,
                 created_at AS createdAt
             FROM users
@@ -285,60 +292,52 @@ async function loadPointUserDetail(userId) {
             LIMIT 1
             `,
             [userId]
-        ),
-        pool.query('SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?', [userId]),
-        pool.query(
-            `
-            SELECT
-                id,
-                user_id AS userId,
-                amount,
-                balance_after AS balanceAfter,
-                transaction_type AS transactionType,
-                note,
-                reference_type AS referenceType,
-                reference_id AS referenceId,
-                created_by AS createdBy,
-                created_at AS createdAt
-            FROM point_transactions
-            WHERE user_id=?
-            ORDER BY created_at DESC, id DESC
-            LIMIT 30
-            `,
-            [userId]
-        ),
-    ]);
+        );
+        if (!userRows.length) {
+            await conn.rollback();
+            return null;
+        }
 
-    const user = userRows[0][0];
-    if (!user) return null;
+        const [storyRows] = await conn.query('SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?', [userId]);
+        const recentTransactions = await loadPointTransactions(30, conn);
+        await conn.commit();
 
-    const sessionLikeUser = {
-        role: user.role,
-        is_premium: Boolean(user.isPremium),
-    };
+        const user = userRows[0];
+        const sessionLikeUser = {
+            role: user.role,
+            is_premium: Boolean(user.isPremium),
+        };
 
-    return {
-        user: {
-            ...user,
-            pointBalance: toNumber(user.pointBalance),
-        },
-        storyCount: toNumber(storyRows[0][0]?.storyCount),
-        storyLimit: getStoryLimitForUser(sessionLikeUser),
-        chatCost: getChatPointCostForUser(sessionLikeUser),
-        recentTransactions: recentTransactions[0].map((row) => ({
-            ...row,
-            userId: toNumber(row.userId),
-            amount: toNumber(row.amount),
-            balanceAfter: toNumber(row.balanceAfter),
-            referenceId: row.referenceId === null || row.referenceId === undefined ? null : toNumber(row.referenceId, null),
-            createdBy: row.createdBy === null || row.createdBy === undefined ? null : toNumber(row.createdBy, null),
-        })),
-    };
+        return {
+            user: {
+                ...user,
+                pointBalance: toNumber(user.pointBalance),
+            },
+            storyCount: toNumber(storyRows[0]?.storyCount),
+            storyLimit: getStoryLimitForUser(sessionLikeUser),
+            chatCost: getChatPointCostForUser(sessionLikeUser),
+            recentTransactions: recentTransactions.map((row) => ({
+                ...row,
+                userId: toNumber(row.userId),
+                amount: toNumber(row.amount),
+                balanceAfter: toNumber(row.balanceAfter),
+                referenceId: row.referenceId === null || row.referenceId === undefined ? null : toNumber(row.referenceId, null),
+                createdBy: row.createdBy === null || row.createdBy === undefined ? null : toNumber(row.createdBy, null),
+            })),
+        };
+    } catch (err) {
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
+    }
 }
 
 async function buildPointDashboard() {
-    const [summaryRows, ledgerRows, topUsers, transactionTypeRows, dailyFlowRows] = await Promise.all([
-        pool.query(`
+    const conn = await pool.getConnection();
+    try {
+        await conn.beginTransaction();
+        const [summaryRows] = await conn.query(`
             SELECT
                 (SELECT COUNT(*) FROM users) AS userCount,
                 (SELECT COUNT(*) FROM users WHERE is_premium=1) AS premiumUserCount,
@@ -349,26 +348,27 @@ async function buildPointDashboard() {
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'welcome' THEN amount ELSE 0 END), 0) FROM point_transactions) AS welcomeGranted,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'topup' THEN amount ELSE 0 END), 0) FROM point_transactions) AS totalTopup,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'chat' AND amount < 0 THEN ABS(amount) ELSE 0 END), 0) FROM point_transactions) AS chatSpent,
+                (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'binding' AND amount < 0 THEN ABS(amount) ELSE 0 END), 0) FROM point_transactions) AS bindingSpent,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'admin_grant' THEN amount ELSE 0 END), 0) FROM point_transactions) AS adminGranted,
                 (SELECT COALESCE(SUM(CASE WHEN transaction_type = 'admin_deduct' AND amount < 0 THEN ABS(amount) ELSE 0 END), 0) FROM point_transactions) AS adminDeducted,
                 (SELECT COUNT(*) FROM point_transactions) AS transactionCount,
                 (SELECT COUNT(*) FROM point_transactions WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS transactions24h,
                 (SELECT COALESCE(SUM(amount), 0) FROM point_transactions WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS net24h
-        `),
-        loadPointTransactions(150),
-        pool.query(`
+        `);
+        const ledgerRows = await loadPointTransactions(150, conn);
+        const [topUsers] = await conn.query(`
             SELECT id, name, email, role, is_premium AS isPremium, point_balance AS pointBalance, created_at AS createdAt
             FROM users
             ORDER BY point_balance DESC, id DESC
             LIMIT 50
-        `),
-        pool.query(`
+        `);
+        const [transactionTypeRows] = await conn.query(`
             SELECT transaction_type AS label, COUNT(*) AS value
             FROM point_transactions
             GROUP BY transaction_type
             ORDER BY value DESC, label ASC
-        `),
-        pool.query(`
+        `);
+        const [dailyFlowRows] = await conn.query(`
             SELECT
                 DATE_FORMAT(created_at, '%Y-%m-%d') AS bucket,
                 COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS inflow,
@@ -378,45 +378,51 @@ async function buildPointDashboard() {
             WHERE created_at >= DATE_SUB(CURDATE(), INTERVAL 13 DAY)
             GROUP BY bucket
             ORDER BY bucket ASC
-        `),
-    ]);
+        `);
+        await conn.commit();
 
-    const summaryRow = summaryRows[0][0] || {};
-    return {
-        summary: {
-            userCount: toNumber(summaryRow.userCount),
-            premiumUserCount: toNumber(summaryRow.premiumUserCount),
-            activePointUserCount: toNumber(summaryRow.activePointUserCount),
-            totalBalance: toNumber(summaryRow.totalBalance),
-            totalInflow: toNumber(summaryRow.totalInflow),
-            totalOutflow: toNumber(summaryRow.totalOutflow),
-            welcomeGranted: toNumber(summaryRow.welcomeGranted),
-            totalTopup: toNumber(summaryRow.totalTopup),
-            chatSpent: toNumber(summaryRow.chatSpent),
-            adminGranted: toNumber(summaryRow.adminGranted),
-            adminDeducted: toNumber(summaryRow.adminDeducted),
-            transactionCount: toNumber(summaryRow.transactionCount),
-            transactions24h: toNumber(summaryRow.transactions24h),
-            net24h: toNumber(summaryRow.net24h),
-        },
-        ledger: ledgerRows,
-        topUsers: topUsers[0].map((row) => ({
-            ...row,
-            id: toNumber(row.id),
-            isPremium: toNumber(row.isPremium),
-            pointBalance: toNumber(row.pointBalance),
-        })),
-        transactionTypes: transactionTypeRows[0].map((row) => ({
-            label: row.label,
-            value: toNumber(row.value),
-        })),
-        dailyFlow: dailyFlowRows[0].map((row) => ({
-            bucket: row.bucket,
-            inflow: toNumber(row.inflow),
-            outflow: toNumber(row.outflow),
-            net: toNumber(row.net),
-        })),
-    };
+        const summaryRow = summaryRows[0] || {};
+        return {
+            summary: {
+                userCount: toNumber(summaryRow.userCount),
+                premiumUserCount: toNumber(summaryRow.premiumUserCount),
+                activePointUserCount: toNumber(summaryRow.activePointUserCount),
+                totalBalance: toNumber(summaryRow.totalBalance),
+                totalInflow: toNumber(summaryRow.totalInflow),
+                totalOutflow: toNumber(summaryRow.totalOutflow),
+                welcomeGranted: toNumber(summaryRow.welcomeGranted),
+                totalTopup: toNumber(summaryRow.totalTopup),
+                chatSpent: toNumber(summaryRow.chatSpent),
+                adminGranted: toNumber(summaryRow.adminGranted),
+                adminDeducted: toNumber(summaryRow.adminDeducted),
+                transactionCount: toNumber(summaryRow.transactionCount),
+                transactions24h: toNumber(summaryRow.transactions24h),
+                net24h: toNumber(summaryRow.net24h),
+            },
+            ledger: ledgerRows,
+            topUsers: topUsers.map((row) => ({
+                ...row,
+                id: toNumber(row.id),
+                isPremium: toNumber(row.isPremium),
+                pointBalance: toNumber(row.pointBalance),
+            })),
+            transactionTypes: transactionTypeRows.map((row) => ({
+                label: row.label,
+                value: toNumber(row.value),
+            })),
+            dailyFlow: dailyFlowRows.map((row) => ({
+                bucket: row.bucket,
+                inflow: toNumber(row.inflow),
+                outflow: toNumber(row.outflow),
+                net: toNumber(row.net),
+            })),
+        };
+    } catch (err) {
+        await conn.rollback();
+        throw err;
+    } finally {
+        conn.release();
+    }
 }
 
 async function refreshDashboard(res, query = {}) {
@@ -465,6 +471,7 @@ async function refreshDashboard(res, query = {}) {
         pointTransactionCount: toNumber(rawSummary.pointTransactionCount),
         pointTopupTotal: toNumber(rawSummary.pointTopupTotal),
         pointChatSpent: toNumber(rawSummary.pointChatSpent),
+        bindingSpent: toNumber(rawSummary.bindingSpent),
         users24h: toNumber(rawSummary.users24h),
         stories24h: toNumber(rawSummary.stories24h),
         messages24h: toNumber(rawSummary.messages24h),
@@ -474,7 +481,7 @@ async function refreshDashboard(res, query = {}) {
     };
 
     const [users] = await pool.query(`
-        SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, point_balance AS pointBalance, created_at AS createdAt
+        SELECT id, name, email, role, provider, is_adult AS isAdult, is_premium AS isPremium, is_suspended AS isSuspended, can_publish_community AS canPublishCommunity, phone_number AS phoneNumber, phone_verified_at AS phoneVerifiedAt, adult_verified_at AS adultVerifiedAt, birth_date AS birthDate, point_balance AS pointBalance, created_at AS createdAt
         FROM users
         ORDER BY created_at DESC, id DESC
     `);

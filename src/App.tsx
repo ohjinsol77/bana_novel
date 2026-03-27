@@ -12,14 +12,30 @@ import {
     fetchCommunityStories,
     fetchAdminDashboard, fetchAdminStoryDetail, updateAdminStoryVisibility, reviewAdminStory,
     deleteAdminStory, updateAdminUser, oauthUrl, updateStorySettings,
-    fetchMyPoints, topUpPoints, fetchAdminPointDashboard, fetchAdminPointUser, adjustAdminUserPoints
+    fetchMyPoints, topUpPoints, fetchAdminPointDashboard, fetchAdminPointUser, adjustAdminUserPoints,
+    updateStoryMessage,
+    requestPhoneVerification, verifyPhoneCode, registerLocalUser, loginLocalUser,
+    completePhoneVerification, completeAdultVerification,
+    prepareStoryBinding, finalizeStoryBinding,
 } from './api';
+import { DEFAULT_BINDING_OPTIONS, buildBindingPages, estimateBindingPageCount, getBindingBodyBudget, normalizeBindingOptions } from '../shared/binding-layout.js';
 import './index.css';
 
 // ── Types ───────────────────────────────────────────────────
 interface AuthUser {
-    id: number; name: string; email: string; role: 'user' | 'admin';
-    is_adult: boolean; is_premium: boolean; can_publish_community: boolean; point_balance: number;
+    id: number;
+    name: string;
+    email: string;
+    role: 'user' | 'admin';
+    provider?: string;
+    is_adult: boolean;
+    is_premium: boolean;
+    can_publish_community: boolean;
+    phone_number?: string | null;
+    phone_verified_at?: string | null;
+    adult_verified_at?: string | null;
+    birth_date?: string | null;
+    point_balance: number;
 }
 
 type StoryPublicMethod = 'private' | 'request' | 'approved' | 'direct';
@@ -68,16 +84,18 @@ export interface Story {
 export interface StoryMessage {
     id: number;
     story_id: number;
+    user_id?: number;
     role: 'user' | 'assistant';
     content: string;
     created_at: string;
 }
 
-type ViewName = 'login' | 'home' | 'community' | 'studio' | 'chat' | 'points' | 'admin';
+type ViewName = 'login' | 'home' | 'community' | 'studio' | 'chat' | 'points' | 'profile' | 'admin' | 'binding';
 type AdminTab = 'overview' | 'users' | 'stories' | 'messages' | 'requests' | 'public' | 'database' | 'points';
 type AdminDatabaseView = 'stats' | 'graph' | 'distribution' | 'filters' | 'tables';
 type AdminSeriesKey = 'users' | 'stories' | 'messages';
-type PointTransactionType = 'welcome' | 'topup' | 'chat' | 'admin_grant' | 'admin_deduct' | 'refund' | 'adjustment';
+type PointTransactionType = 'welcome' | 'topup' | 'chat' | 'binding' | 'admin_grant' | 'admin_deduct' | 'refund' | 'adjustment';
+type BindingPageKind = 'cover' | 'author_note' | 'body';
 
 const APPLE_ADMIN_LOCAL_TOKEN = 'apple-admin-local';
 
@@ -91,6 +109,10 @@ interface AdminUserRow {
     isPremium: number;
     isSuspended: number;
     canPublishCommunity: number;
+    phoneNumber?: string | null;
+    phoneVerifiedAt?: string | null;
+    adultVerifiedAt?: string | null;
+    birthDate?: string | null;
     pointBalance: number;
     createdAt: string;
 }
@@ -138,6 +160,8 @@ interface PointMeData {
     storyLimit: number;
     storyCount: number;
     canCharge: boolean;
+    identityVerified?: boolean;
+    adultVerified?: boolean;
     recentTransactions: PointTransactionRow[];
 }
 
@@ -152,6 +176,7 @@ interface AdminPointDashboard {
         welcomeGranted: number;
         totalTopup: number;
         chatSpent: number;
+        bindingSpent: number;
         adminGranted: number;
         adminDeducted: number;
         transactionCount: number;
@@ -173,6 +198,10 @@ interface AdminPointUserDetail {
         isPremium: number;
         isSuspended: number;
         canPublishCommunity: number;
+        phoneNumber?: string | null;
+        phoneVerifiedAt?: string | null;
+        adultVerifiedAt?: string | null;
+        birthDate?: string | null;
         pointBalance: number;
         createdAt: string;
     };
@@ -232,6 +261,43 @@ interface AdminRangeSummary {
     bucketCount: number;
 }
 
+interface BindingSession {
+    storyId: number;
+    title: string;
+    background: string;
+    environment: string;
+    options: BindingOptions;
+    viewerSettings: Partial<ReaderSettings>;
+    messages: StoryMessage[];
+    pageCount: number;
+    cost: number;
+    remainingPoints: number;
+    coverImageUrl?: string | null;
+    authorName?: string | null;
+    createdAt?: string | null;
+    pages: BindingPage[];
+}
+
+interface BindingPageBlock {
+    id: string;
+    role: 'user' | 'assistant';
+    content: string;
+    chunkIndex?: number;
+}
+
+interface BindingPage {
+    number: number;
+    kind: BindingPageKind;
+    blocks: BindingPageBlock[];
+}
+
+interface BindingOptions {
+    includeCover: boolean;
+    includeUserText: boolean;
+    includeAuthorNote: boolean;
+    authorNoteText?: string;
+}
+
 interface AdminSelectedRange {
     preset: '24h' | '7d' | '30d' | 'custom';
     start: string;
@@ -273,6 +339,7 @@ interface AdminSummary {
     messageCount: number;
     storyOwnerCount: number;
     activeWriterCount: number;
+    bindingSpent: number;
     users24h: number;
     stories24h: number;
     messages24h: number;
@@ -450,6 +517,12 @@ const DEFAULT_READER_SETTINGS: ReaderSettings = {
     aiColorR: 18, aiColorG: 18, aiColorB: 18,
 };
 
+const DEFAULT_BINDING_VIEWER_SETTINGS: Partial<ReaderSettings> = {
+    fontFamily: 'Pretendard',
+    fontSize: 10,
+    lineHeight: 1.55,
+};
+
 function isCompactReaderViewport() {
     return window.innerWidth <= 900 || window.innerHeight <= window.innerWidth * 1.08;
 }
@@ -538,8 +611,34 @@ function getChatCostForUser(user: AuthUser | null) {
     return user?.is_premium ? 10 : 15;
 }
 
+function formatPointTransactionTypeLabel(type: PointTransactionType) {
+    switch (type) {
+        case 'welcome': return '웰컴';
+        case 'topup': return '충전';
+        case 'chat': return '대화 차감';
+        case 'binding': return '제본 차감';
+        case 'admin_grant': return '관리자 지급';
+        case 'admin_deduct': return '관리자 회수';
+        case 'refund': return '환불';
+        default: return '조정';
+    }
+}
+
 function formatPointAmount(value: number | null | undefined) {
     return `${new Intl.NumberFormat('ko-KR').format(Number(value || 0))}P`;
+}
+
+function formatKoreanDateTime(value: string) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime())
+        ? '-'
+        : date.toLocaleString('ko-KR', {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+        });
 }
 
 function limitLongText(value: string) {
@@ -564,7 +663,7 @@ function getErrorMessage(err: unknown) {
 }
 
 function normalizeView(value: string): ViewName {
-    return value === 'login' || value === 'home' || value === 'community' || value === 'studio' || value === 'chat' || value === 'points' || value === 'admin'
+    return value === 'login' || value === 'home' || value === 'community' || value === 'studio' || value === 'chat' || value === 'points' || value === 'profile' || value === 'admin' || value === 'binding'
         ? value
         : 'home';
 }
@@ -729,17 +828,69 @@ export default function App() {
     const [insufficientPointsOpen, setInsufficientPointsOpen] = useState(false);
     const [insufficientPointNeed, setInsufficientPointNeed] = useState(0);
     const [insufficientPointHave, setInsufficientPointHave] = useState(0);
+    const [insufficientPointMessage, setInsufficientPointMessage] = useState('대화를 위한 포인트가 부족합니다 충전하시겠습니까?');
+    const [bindingOptions, setBindingOptions] = useState<BindingOptions>({ ...DEFAULT_BINDING_OPTIONS });
+    const [bindingQuoteOpen, setBindingQuoteOpen] = useState(false);
+    const [bindingQuoteLoading, setBindingQuoteLoading] = useState(false);
+    const [bindingPreview, setBindingPreview] = useState<BindingSession | null>(null);
+    const [bindingOpenError, setBindingOpenError] = useState('');
+    const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+    const [localLoginEmail, setLocalLoginEmail] = useState('');
+    const [localLoginPassword, setLocalLoginPassword] = useState('');
+    const [localLoginLoading, setLocalLoginLoading] = useState(false);
+    const [localLoginError, setLocalLoginError] = useState('');
+    const [signupName, setSignupName] = useState('');
+    const [signupEmail, setSignupEmail] = useState('');
+    const [signupPassword, setSignupPassword] = useState('');
+    const [signupBirthDate, setSignupBirthDate] = useState('');
+    const [signupPhoneNumber, setSignupPhoneNumber] = useState('');
+    const [signupPhoneRequestId, setSignupPhoneRequestId] = useState<number | null>(null);
+    const [signupPhoneCode, setSignupPhoneCode] = useState('');
+    const [signupPhoneToken, setSignupPhoneToken] = useState('');
+    const [signupPhoneSending, setSignupPhoneSending] = useState(false);
+    const [signupPhoneVerifying, setSignupPhoneVerifying] = useState(false);
+    const [signupLoading, setSignupLoading] = useState(false);
+    const [signupError, setSignupError] = useState('');
+    const [signupInfo, setSignupInfo] = useState('');
+    const [profilePhoneNumber, setProfilePhoneNumber] = useState('');
+    const [profilePhoneRequestId, setProfilePhoneRequestId] = useState<number | null>(null);
+    const [profilePhoneCode, setProfilePhoneCode] = useState('');
+    const [profilePhoneSending, setProfilePhoneSending] = useState(false);
+    const [profilePhoneVerifying, setProfilePhoneVerifying] = useState(false);
+    const [profileAdultBirthDate, setProfileAdultBirthDate] = useState('');
+    const [profileAdultPhoneNumber, setProfileAdultPhoneNumber] = useState('');
+    const [profileAdultRequestId, setProfileAdultRequestId] = useState<number | null>(null);
+    const [profileAdultCode, setProfileAdultCode] = useState('');
+    const [profileAdultSending, setProfileAdultSending] = useState(false);
+    const [profileAdultVerifying, setProfileAdultVerifying] = useState(false);
+    const [profileActionMessage, setProfileActionMessage] = useState('');
     const [adminPointDashboard, setAdminPointDashboard] = useState<AdminPointDashboard | null>(null);
     const [adminPointLoading, setAdminPointLoading] = useState(false);
     const [adminPointError, setAdminPointError] = useState('');
     const [adminPointUserDetail, setAdminPointUserDetail] = useState<AdminPointUserDetail | null>(null);
+    const [adminPointUserView, setAdminPointUserView] = useState<'summary' | 'ledger'>('summary');
+    const [adminPointLedgerPage, setAdminPointLedgerPage] = useState(0);
     const [adminPointUserLoading, setAdminPointUserLoading] = useState(false);
     const [adminPointAdjustment, setAdminPointAdjustment] = useState('');
     const [adminPointAdjustmentNote, setAdminPointAdjustmentNote] = useState('');
     const [editMode, setEditMode] = useState<'new' | 'edit'>('new');
+    const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
+    const [editingMessageDraft, setEditingMessageDraft] = useState('');
+    const [editingMessageSaving, setEditingMessageSaving] = useState(false);
+    const [editedMessageScrollTargetId, setEditedMessageScrollTargetId] = useState<number | null>(null);
     const chatBottomRef = useRef<HTMLDivElement>(null);
     const pointDataLoadedForUserRef = useRef<number | null>(null);
     const adminPointDashboardLoadedRef = useRef(false);
+    const editingMessageTextareaRef = useRef<HTMLTextAreaElement>(null);
+    const storyMessageRefs = useRef<Record<number, HTMLDivElement | null>>({});
+    const bindingPrintRef = useRef<HTMLDivElement>(null);
+    const bindingPreviewHydratedRef = useRef(false);
+    const bindingPrintChargeRef = useRef<{
+        storyId: number;
+        options: BindingOptions;
+        cost: number;
+    } | null>(null);
+    const bindingPrintChargeRunningRef = useRef(false);
 
     // Reader Settings (Restored)
     const [readerSettings, setReaderSettings] = useState<ReaderSettings>({ ...DEFAULT_READER_SETTINGS });
@@ -761,6 +912,15 @@ export default function App() {
             setView(newView);
         }
     };
+
+    const loadStories = useCallback(async () => {
+        try {
+            const data = await fetchStories();
+            setStories(data.map(normalizeStoryForClient));
+        } catch (err: unknown) {
+            console.error('Load stories failed:', err);
+        }
+    }, []);
 
     // ── Bootstrap: read token from URL or localStorage ──────
     useEffect(() => {
@@ -798,7 +958,7 @@ export default function App() {
         });
 
         return () => window.removeEventListener('popstate', handlePopState);
-    }, []);
+    }, [loadStories]);
 
     useEffect(() => {
         const handleResize = () => {
@@ -808,6 +968,20 @@ export default function App() {
         window.addEventListener('resize', handleResize);
         handleResize();
         return () => window.removeEventListener('resize', handleResize);
+    }, []);
+
+    useEffect(() => {
+        if (!bindingPreviewHydratedRef.current) return;
+        if (bindingPreview) {
+            sessionStorage.setItem('bindingPreview', JSON.stringify(bindingPreview));
+        } else {
+            sessionStorage.removeItem('bindingPreview');
+        }
+    }, [bindingPreview]);
+
+    useEffect(() => {
+        sessionStorage.removeItem('bindingPreview');
+        bindingPreviewHydratedRef.current = true;
     }, []);
 
     const useVerticalReader = readerSettings.aspectRatio === 'tall' || isCompactReader;
@@ -845,16 +1019,6 @@ export default function App() {
         return () => clearTimeout(timer);
     }, [readerSettings, activeStory, view]);
 
-    // ── Handlers ─────────────────────────────────────────────
-    const loadStories = async () => {
-        try {
-            const data = await fetchStories();
-            setStories(data.map(normalizeStoryForClient));
-        } catch (err: unknown) {
-            console.error('Load stories failed:', err);
-        }
-    };
-
     const loadCommunityStories = useCallback(async () => {
         try {
             setCommunityLoading(true);
@@ -885,6 +1049,8 @@ export default function App() {
                 storyLimit: Number(data.storyLimit ?? data.story_limit ?? getStoryLimitForUser(user)),
                 storyCount: Number(data.storyCount ?? data.story_count ?? stories.length),
                 canCharge: Boolean(data.canCharge ?? data.can_charge ?? true),
+                identityVerified: Boolean(data.identityVerified ?? data.identity_verified ?? user.phone_verified_at),
+                adultVerified: Boolean(data.adultVerified ?? data.adult_verified ?? user.is_adult),
                 recentTransactions: Array.isArray(data.recentTransactions)
                     ? data.recentTransactions
                     : Array.isArray(data.recent_transactions)
@@ -903,6 +1069,76 @@ export default function App() {
         }
     }, [user, stories.length]);
 
+    useEffect(() => {
+        const handleAfterPrint = () => {
+            const intent = bindingPrintChargeRef.current;
+            if (!intent || bindingPrintChargeRunningRef.current) return;
+
+            bindingPrintChargeRunningRef.current = true;
+            void finalizeStoryBinding(intent.storyId, intent.options)
+                .then((result) => {
+                    const nextBalance = Number(result?.remainingPoints ?? 0);
+                    setPointData((current) => current ? {
+                        ...current,
+                        pointBalance: nextBalance,
+                    } : current);
+                    setUser((current) => current ? {
+                        ...current,
+                        point_balance: nextBalance,
+                    } : current);
+                    setBindingPreview((current) => current && current.storyId === intent.storyId ? {
+                        ...current,
+                        remainingPoints: nextBalance,
+                        cost: Number(result?.cost ?? current.cost),
+                        pageCount: Number(result?.pageCount ?? current.pageCount),
+                    } : current);
+                    void loadPointData().catch(() => undefined);
+                })
+                .catch((err: unknown) => {
+                    console.error('Finalize binding export failed:', err);
+                    setBindingOpenError(getErrorMessage(err));
+                })
+                .finally(() => {
+                    bindingPrintChargeRunningRef.current = false;
+                    bindingPrintChargeRef.current = null;
+                });
+        };
+
+        window.addEventListener('afterprint', handleAfterPrint);
+        return () => window.removeEventListener('afterprint', handleAfterPrint);
+    }, [loadPointData]);
+
+    const applyAuthenticatedSession = useCallback(async (payload: { token: string; user?: AuthUser | Record<string, unknown> | null }) => {
+        localStorage.setItem('token', payload.token);
+        const nextUser = payload.user ? {
+            ...(payload.user as AuthUser),
+            point_balance: Number((payload.user as AuthUser).point_balance ?? 0),
+        } : null;
+        if (nextUser) {
+            setUser(nextUser);
+            pointDataLoadedForUserRef.current = null;
+            setPointData(null);
+            setStories([]);
+            setActiveStory(null);
+            setStoryMessages([]);
+            setEditingMessageId(null);
+            setEditingMessageDraft('');
+            setEditingMessageSaving(false);
+            setEditedMessageScrollTargetId(null);
+            await loadStories();
+        } else {
+            const me = await fetchMe();
+            if (!me) {
+                throw new Error('로그인 정보를 불러오지 못했습니다.');
+            }
+            setUser({ ...me, point_balance: Number(me.point_balance ?? 0) });
+            pointDataLoadedForUserRef.current = null;
+            setPointData(null);
+            await loadStories();
+        }
+        setView('home');
+    }, [loadStories]);
+
     const loadAdminPointDashboard = useCallback(async () => {
         try {
             setAdminPointLoading(true);
@@ -919,6 +1155,7 @@ export default function App() {
                     welcomeGranted: Number(data.summary?.welcomeGranted ?? data.summary?.welcome_granted ?? 0),
                     totalTopup: Number(data.summary?.totalTopup ?? data.summary?.total_topup ?? 0),
                     chatSpent: Number(data.summary?.chatSpent ?? data.summary?.chat_spent ?? 0),
+                    bindingSpent: Number(data.summary?.bindingSpent ?? data.summary?.binding_spent ?? 0),
                     adminGranted: Number(data.summary?.adminGranted ?? data.summary?.admin_granted ?? 0),
                     adminDeducted: Number(data.summary?.adminDeducted ?? data.summary?.admin_deducted ?? 0),
                     transactionCount: Number(data.summary?.transactionCount ?? data.summary?.transaction_count ?? 0),
@@ -942,6 +1179,8 @@ export default function App() {
     const openAdminPointUser = useCallback(async (userId: number) => {
         try {
             setAdminPointUserLoading(true);
+            setAdminPointUserView('summary');
+            setAdminPointLedgerPage(0);
             const detail = await fetchAdminPointUser(userId);
             setAdminPointUserDetail({
                 user: {
@@ -954,6 +1193,10 @@ export default function App() {
                     isPremium: Number(detail.user?.isPremium ?? detail.user?.is_premium ?? detail.member?.isPremium ?? detail.member?.is_premium ?? 0),
                     isSuspended: Number(detail.user?.isSuspended ?? detail.user?.is_suspended ?? detail.member?.isSuspended ?? detail.member?.is_suspended ?? 0),
                     canPublishCommunity: Number(detail.user?.canPublishCommunity ?? detail.user?.can_publish_community ?? detail.member?.canPublishCommunity ?? detail.member?.can_publish_community ?? 0),
+                    phoneNumber: String(detail.user?.phoneNumber ?? detail.user?.phone_number ?? detail.member?.phoneNumber ?? detail.member?.phone_number ?? ''),
+                    phoneVerifiedAt: String(detail.user?.phoneVerifiedAt ?? detail.user?.phone_verified_at ?? detail.member?.phoneVerifiedAt ?? detail.member?.phone_verified_at ?? ''),
+                    adultVerifiedAt: String(detail.user?.adultVerifiedAt ?? detail.user?.adult_verified_at ?? detail.member?.adultVerifiedAt ?? detail.member?.adult_verified_at ?? ''),
+                    birthDate: String(detail.user?.birthDate ?? detail.user?.birth_date ?? detail.member?.birthDate ?? detail.member?.birth_date ?? ''),
                     pointBalance: Number(detail.user?.pointBalance ?? detail.user?.point_balance ?? detail.member?.pointBalance ?? detail.member?.point_balance ?? 0),
                     createdAt: String(detail.user?.createdAt ?? detail.user?.created_at ?? detail.member?.createdAt ?? detail.member?.created_at ?? ''),
                 },
@@ -973,6 +1216,12 @@ export default function App() {
             setAdminPointUserLoading(false);
         }
     }, []);
+
+    const closeAdminPointUserDetail = () => {
+        setAdminPointUserDetail(null);
+        setAdminPointUserView('summary');
+        setAdminPointLedgerPage(0);
+    };
 
     const logout = () => {
         localStorage.removeItem('token');
@@ -997,7 +1246,44 @@ export default function App() {
         setCommunityQuery('');
         pointDataLoadedForUserRef.current = null;
         adminPointDashboardLoadedRef.current = false;
-        navigate('login');
+        setEditingMessageId(null);
+        setEditingMessageDraft('');
+        setEditingMessageSaving(false);
+        setEditedMessageScrollTargetId(null);
+        setBindingPreview(null);
+        setBindingOptions({ ...DEFAULT_BINDING_OPTIONS });
+        setBindingQuoteOpen(false);
+        setBindingQuoteLoading(false);
+        setBindingOpenError('');
+        setLocalLoginEmail('');
+        setLocalLoginPassword('');
+        setLocalLoginError('');
+        setSignupName('');
+        setSignupEmail('');
+        setSignupPassword('');
+        setSignupBirthDate('');
+        setSignupPhoneNumber('');
+        setSignupPhoneRequestId(null);
+        setSignupPhoneCode('');
+        setSignupPhoneToken('');
+        setSignupPhoneSending(false);
+        setSignupPhoneVerifying(false);
+        setSignupLoading(false);
+        setSignupError('');
+        setSignupInfo('');
+        setProfilePhoneNumber('');
+        setProfilePhoneRequestId(null);
+        setProfilePhoneCode('');
+        setProfilePhoneSending(false);
+        setProfilePhoneVerifying(false);
+        setProfileAdultBirthDate('');
+        setProfileAdultPhoneNumber('');
+        setProfileAdultRequestId(null);
+        setProfileAdultCode('');
+        setProfileAdultSending(false);
+        setProfileAdultVerifying(false);
+        setProfileActionMessage('');
+        navigate('home');
     };
 
     const openNewStory = () => {
@@ -1084,22 +1370,247 @@ export default function App() {
         }
     };
 
+    const reloadActiveStoryMessages = async (storyId: number) => {
+        const history = await fetchStoryMessages(storyId);
+        setStoryMessages(history);
+        return history;
+    };
+
     const openStoryReader = async (story: Story) => {
         try {
             const normalizedStory = normalizeStoryForClient(story);
             setActiveStory(normalizedStory);
+            setEditingMessageId(null);
+            setEditingMessageDraft('');
+            setEditedMessageScrollTargetId(null);
             // 매번 기본값에서 시작해 스토리별 설정만 덮어써야 이전 스토리의 설정이 섞이지 않습니다.
             setReaderSettings({
                 ...DEFAULT_READER_SETTINGS,
                 ...(normalizedStory.viewer_settings || {}),
             });
-            const history = await fetchStoryMessages(normalizedStory.id);
-            setStoryMessages(history);
+            setBindingPreview(null);
+            setBindingOptions({ ...DEFAULT_BINDING_OPTIONS });
+            setBindingQuoteOpen(false);
+            setBindingOpenError('');
+            await reloadActiveStoryMessages(normalizedStory.id);
             isInitialChatLoad.current = true;
             navigate('chat'); // chat view is actually the reader
         } catch (err: unknown) {
             console.error('Open reader failed:', err);
             alert(`집필 창을 열 수 없습니다: ${getErrorMessage(err)}`);
+        }
+    };
+
+    const createBindingPreview = (
+        optionsInput: BindingOptions,
+        sourceStory: Story | null = activeStory,
+        sourceMessages: StoryMessage[] = storyMessages,
+        sourceViewerSettings: Partial<ReaderSettings> = readerSettings,
+        sourceRemainingPoints: number = pointData?.pointBalance ?? user?.point_balance ?? 0
+    ): BindingSession | null => {
+        if (!sourceStory) return null;
+
+        const options = normalizeBindingOptions(optionsInput);
+        const messages = [...sourceMessages];
+        const pages = buildBindingPages({
+            title: sourceStory.title || '',
+            background: sourceStory.background || '',
+            environment: sourceStory.environment || '',
+            messages,
+            viewerSettings: {
+                ...DEFAULT_BINDING_VIEWER_SETTINGS,
+                ...sourceViewerSettings,
+            },
+            options,
+        }) as BindingPage[];
+
+        return {
+            storyId: sourceStory.id,
+            title: sourceStory.title || '',
+            background: sourceStory.background || '',
+            environment: sourceStory.environment || '',
+            options,
+            viewerSettings: {
+                ...DEFAULT_BINDING_VIEWER_SETTINGS,
+                ...sourceViewerSettings,
+            },
+            messages,
+            pageCount: pages.length,
+            cost: pages.length,
+            remainingPoints: sourceRemainingPoints,
+            coverImageUrl: sourceStory.cover_image_url || null,
+            authorName: user?.name || null,
+            createdAt: sourceStory.created_at || null,
+            pages,
+        };
+    };
+
+    const syncBindingPreview = (nextOptions: BindingOptions) => {
+        const normalizedOptions = normalizeBindingOptions(nextOptions);
+        setBindingOptions(normalizedOptions);
+        const preview = createBindingPreview(normalizedOptions);
+        if (preview) {
+            setBindingPreview(preview);
+        }
+        return preview;
+    };
+
+    const openBindingQuote = () => {
+        if (!activeStory) {
+            alert('이야기를 먼저 열어주세요.');
+            return;
+        }
+        if (storyMessages.length === 0) {
+            alert('제본할 내용이 없습니다.');
+            return;
+        }
+
+        const nextPreview = syncBindingPreview(bindingOptions);
+        setBindingOpenError('');
+        setBindingQuoteOpen(true);
+        setBindingPreview(nextPreview ?? createBindingPreview(bindingOptions));
+    };
+
+    const closeBindingQuote = () => {
+        setBindingQuoteOpen(false);
+        setBindingQuoteLoading(false);
+        setBindingOpenError('');
+    };
+
+    const confirmBindingExport = async () => {
+        if (!activeStory || bindingQuoteLoading) return;
+
+        const draftPreview = bindingPreview ?? createBindingPreview(bindingOptions);
+        const estimatedPages = draftPreview?.pages?.length ?? draftPreview?.pageCount ?? createBindingPreview(bindingOptions)?.pageCount ?? 1;
+        const currentBalance = pointData?.pointBalance ?? user?.point_balance ?? 0;
+
+        if (currentBalance < estimatedPages) {
+            setBindingQuoteOpen(false);
+            setInsufficientPointNeed(estimatedPages);
+            setInsufficientPointHave(currentBalance);
+            setInsufficientPointMessage('제본을 위한 포인트가 부족합니다 충전하시겠습니까?');
+            setInsufficientPointsOpen(true);
+            return;
+        }
+
+        try {
+            setBindingQuoteLoading(true);
+            const result = await prepareStoryBinding(activeStory.id, bindingOptions);
+            const bindingData = result?.binding || {};
+            const normalizedMessages = Array.isArray(bindingData.messages) ? bindingData.messages : [...storyMessages];
+            const fallbackPages = buildBindingPages({
+                title: String(bindingData.title ?? activeStory.title ?? ''),
+                background: String(bindingData.background ?? activeStory.background ?? ''),
+                environment: String(bindingData.environment ?? activeStory.environment ?? ''),
+                messages: normalizedMessages,
+                viewerSettings: {
+                    ...readerSettings,
+                    ...(bindingData.viewerSettings || {}),
+                },
+                options: bindingOptions,
+            }) as BindingPage[];
+            const pages = Array.isArray(bindingData.pages) && bindingData.pages.length ? (bindingData.pages as BindingPage[]) : fallbackPages;
+            const nextPreview: BindingSession = {
+                storyId: Number(bindingData.storyId ?? activeStory.id),
+                title: String(bindingData.title ?? activeStory.title ?? ''),
+                background: String(bindingData.background ?? activeStory.background ?? ''),
+                environment: String(bindingData.environment ?? activeStory.environment ?? ''),
+                options: normalizeBindingOptions(bindingData.options || bindingOptions),
+                viewerSettings: {
+                    ...readerSettings,
+                    ...(bindingData.viewerSettings || {}),
+                },
+                messages: normalizedMessages,
+                pageCount: Number(result?.pageCount ?? bindingData.pageCount ?? pages.length ?? estimatedPages ?? 1),
+                cost: Number(result?.cost ?? bindingData.cost ?? pages.length ?? estimatedPages ?? 1),
+                remainingPoints: Number(result?.remainingPoints ?? currentBalance),
+                coverImageUrl: String(bindingData.coverImageUrl ?? activeStory.cover_image_url ?? '') || null,
+                authorName: String(bindingData.authorName ?? user?.name ?? '') || null,
+                createdAt: String(bindingData.createdAt ?? activeStory.created_at ?? '') || null,
+                pages,
+            };
+            setBindingPreview(nextPreview);
+            closeBindingQuote();
+            navigate('binding');
+        } catch (err: unknown) {
+            console.error('Prepare binding export failed:', err);
+            const message = getErrorMessage(err);
+            if ((err as Error & { code?: string }).code === 'INSUFFICIENT_POINTS') {
+                setBindingQuoteOpen(false);
+                setInsufficientPointNeed(estimatedPages);
+                setInsufficientPointHave(currentBalance);
+                setInsufficientPointMessage('제본을 위한 포인트가 부족합니다 충전하시겠습니까?');
+                setInsufficientPointsOpen(true);
+                return;
+            }
+            setBindingOpenError(message);
+        } finally {
+            setBindingQuoteLoading(false);
+        }
+    };
+
+    const handleBindingPrint = () => {
+        if (!bindingPreview || bindingPrintChargeRunningRef.current || bindingPreview.pageCount <= 0) return;
+        bindingPrintChargeRef.current = {
+            storyId: bindingPreview.storyId,
+            options: bindingPreview.options,
+            cost: bindingPreview.cost,
+        };
+        window.print();
+    };
+
+    const updateBindingOption = (patch: Partial<BindingOptions>) => {
+        const nextOptions = normalizeBindingOptions({ ...bindingOptions, ...patch });
+        setBindingOptions(nextOptions);
+        const preview = createBindingPreview(nextOptions);
+        if (preview) {
+            setBindingPreview(preview);
+        }
+    };
+
+    const canEditStoryMessage = (message: StoryMessage) => {
+        return Boolean(
+            user
+            && activeStory
+            && activeStory.user_id === user.id
+            && message.role === 'assistant'
+        );
+    };
+
+    const beginEditStoryMessage = (message: StoryMessage) => {
+        if (!canEditStoryMessage(message)) return;
+        setEditingMessageId(message.id);
+        setEditingMessageDraft(message.content);
+        setEditedMessageScrollTargetId(message.id);
+    };
+
+    const cancelEditStoryMessage = () => {
+        setEditingMessageId(null);
+        setEditingMessageDraft('');
+        setEditingMessageSaving(false);
+        setEditedMessageScrollTargetId(null);
+    };
+
+    const saveEditedStoryMessage = async () => {
+        if (!activeStory || editingMessageId === null || editingMessageSaving) return;
+        const trimmed = editingMessageDraft.trim();
+        if (!trimmed) {
+            alert('수정할 내용을 입력하세요.');
+            return;
+        }
+
+        try {
+            setEditingMessageSaving(true);
+            await updateStoryMessage(activeStory.id, editingMessageId, trimmed);
+            setEditingMessageId(null);
+            setEditingMessageDraft('');
+            setEditedMessageScrollTargetId(editingMessageId);
+            await reloadActiveStoryMessages(activeStory.id);
+        } catch (err: unknown) {
+            console.error('Edit story message failed:', err);
+            alert(`메시지 수정 실패: ${getErrorMessage(err)}`);
+        } finally {
+            setEditingMessageSaving(false);
         }
     };
 
@@ -1121,6 +1632,7 @@ export default function App() {
         if (currentBalance < pointsNeeded) {
             setInsufficientPointNeed(pointsNeeded);
             setInsufficientPointHave(currentBalance);
+            setInsufficientPointMessage('대화를 위한 포인트가 부족합니다 충전하시겠습니까?');
             setInsufficientPointsOpen(true);
             return;
         }
@@ -1128,13 +1640,13 @@ export default function App() {
         const userMessageId = Date.now();
         setMsgInput('');
         setIsSending(true);
-        setStoryMessages(prev => [...prev, { id: userMessageId, story_id: activeStory.id, role: 'user', content, created_at: '' }]);
+        setStoryMessages(prev => [...prev, { id: userMessageId, story_id: activeStory.id, user_id: user?.id ?? 0, role: 'user', content, created_at: '' }]);
 
         try {
             console.info('집필 요청 시작:', { storyId: activeStory.id, contentLength: content.length });
             const reply = await sendStoryMessage(activeStory.id, content);
             console.info('집필 요청 완료:', { storyId: activeStory.id, hasReply: Boolean(reply?.content) });
-            setStoryMessages(prev => [...prev, { id: reply.id ?? Date.now() + 1, story_id: activeStory.id, role: 'assistant', content: reply.content, created_at: '' }]);
+            setStoryMessages(prev => [...prev, { id: reply.id ?? Date.now() + 1, story_id: activeStory.id, user_id: user?.id ?? 0, role: 'assistant', content: reply.content, created_at: '' }]);
             if (typeof reply.remainingPoints === 'number') {
                 setUser((current) => current ? { ...current, point_balance: reply.remainingPoints } : current);
                 setPointData((current) => current ? {
@@ -1160,6 +1672,7 @@ export default function App() {
                 {
                     id: Date.now() + 1,
                     story_id: activeStory.id,
+                    user_id: user?.id ?? 0,
                     role: 'assistant',
                     content: `[오류] 집필 요청 실패: ${errorMessage}`,
                     created_at: ''
@@ -1188,8 +1701,227 @@ export default function App() {
             await loadPointData().catch(() => undefined);
             alert(`${formatPointAmount(amount)} 충전이 반영됐습니다.`);
         } catch (err: unknown) {
-            setPointError(getErrorMessage(err));
+            const message = getErrorMessage(err);
+            setPointError(message);
+            if (/본인인증|PHONE_VERIFICATION_REQUIRED/i.test(message)) {
+                navigate('profile');
+            }
             throw err;
+        }
+    };
+
+    const handleLocalLogin = async () => {
+        const email = localLoginEmail.trim();
+        const password = localLoginPassword;
+        if (!email || !password) {
+            setLocalLoginError('이메일과 비밀번호를 입력해주세요.');
+            return;
+        }
+
+        try {
+            setLocalLoginLoading(true);
+            setLocalLoginError('');
+            const result = await loginLocalUser({ email, password });
+            await applyAuthenticatedSession(result);
+            setLocalLoginPassword('');
+        } catch (err: unknown) {
+            setLocalLoginError(getErrorMessage(err));
+        } finally {
+            setLocalLoginLoading(false);
+        }
+    };
+
+    const handleSignupRequestCode = async () => {
+        const phoneNumber = signupPhoneNumber.trim();
+        if (!phoneNumber) {
+            setSignupError('휴대폰 번호를 입력해주세요.');
+            return;
+        }
+        try {
+            setSignupPhoneSending(true);
+            setSignupError('');
+            const result = await requestPhoneVerification({ phoneNumber, purpose: 'signup' });
+            setSignupPhoneRequestId(Number(result.verificationId));
+            setSignupInfo(result.debugCode ? `개발용 인증번호: ${result.debugCode}` : '인증번호를 전송했습니다.');
+        } catch (err: unknown) {
+            setSignupError(getErrorMessage(err));
+        } finally {
+            setSignupPhoneSending(false);
+        }
+    };
+
+    const handleSignupVerifyCode = async () => {
+        if (!signupPhoneRequestId) {
+            setSignupError('먼저 인증번호를 요청해주세요.');
+            return;
+        }
+        const code = signupPhoneCode.trim();
+        if (!code) {
+            setSignupError('인증번호를 입력해주세요.');
+            return;
+        }
+
+        try {
+            setSignupPhoneVerifying(true);
+            setSignupError('');
+            const result = await verifyPhoneCode({ verificationId: signupPhoneRequestId, code });
+            setSignupPhoneToken(result.verificationToken);
+            setSignupInfo('휴대폰 인증이 완료되었습니다.');
+        } catch (err: unknown) {
+            setSignupError(getErrorMessage(err));
+        } finally {
+            setSignupPhoneVerifying(false);
+        }
+    };
+
+    const handleSignupSubmit = async () => {
+        if (!signupPhoneToken) {
+            setSignupError('휴대폰 인증을 먼저 완료해주세요.');
+            return;
+        }
+        if (!signupName.trim() || !signupEmail.trim() || !signupPassword) {
+            setSignupError('이름, 이메일, 비밀번호를 모두 입력해주세요.');
+            return;
+        }
+
+        try {
+            setSignupLoading(true);
+            setSignupError('');
+            const result = await registerLocalUser({
+                name: signupName.trim(),
+                email: signupEmail.trim(),
+                password: signupPassword,
+                birthDate: signupBirthDate || undefined,
+                phoneVerificationToken: signupPhoneToken,
+            });
+            await applyAuthenticatedSession(result);
+            setSignupInfo('회원가입이 완료되었습니다. 환영 포인트가 지급됐습니다.');
+            setSignupPassword('');
+            setSignupPhoneCode('');
+            setSignupPhoneToken('');
+            setSignupPhoneRequestId(null);
+        } catch (err: unknown) {
+            setSignupError(getErrorMessage(err));
+        } finally {
+            setSignupLoading(false);
+        }
+    };
+
+    const handleProfilePhoneRequest = async () => {
+        if (!user) return;
+        const phoneNumber = profilePhoneNumber.trim() || user.phone_number || '';
+        if (!phoneNumber) {
+            setProfileActionMessage('휴대폰 번호를 입력해주세요.');
+            return;
+        }
+
+        try {
+            setProfilePhoneSending(true);
+            setProfileActionMessage('');
+            const result = await requestPhoneVerification({ phoneNumber, purpose: 'identity', createdForUserId: user.id });
+            setProfilePhoneRequestId(Number(result.verificationId));
+            setProfilePhoneNumber(phoneNumber);
+            setProfileActionMessage(result.debugCode ? `개발용 인증번호: ${result.debugCode}` : '인증번호를 전송했습니다.');
+        } catch (err: unknown) {
+            setProfileActionMessage(getErrorMessage(err));
+        } finally {
+            setProfilePhoneSending(false);
+        }
+    };
+
+    const handleProfilePhoneVerify = async () => {
+        if (!profilePhoneRequestId) {
+            setProfileActionMessage('먼저 인증번호를 요청해주세요.');
+            return;
+        }
+
+        try {
+            setProfilePhoneVerifying(true);
+            setProfileActionMessage('');
+            const verifyResult = await verifyPhoneCode({ verificationId: profilePhoneRequestId, code: profilePhoneCode.trim() });
+            const completeResult = await completePhoneVerification({ verificationToken: verifyResult.verificationToken });
+            if (completeResult?.user) {
+                setUser((current) => current ? { ...current, ...(completeResult.user as AuthUser) } : current);
+            } else {
+                const me = await fetchMe();
+                if (me) {
+                    setUser({ ...me, point_balance: Number(me.point_balance ?? 0) });
+                }
+            }
+            setPointData((current) => current ? {
+                ...current,
+                canCharge: true,
+                identityVerified: true,
+            } : current);
+            setProfileActionMessage('본인인증이 완료되었습니다.');
+            setProfilePhoneCode('');
+            setProfilePhoneRequestId(null);
+        } catch (err: unknown) {
+            setProfileActionMessage(getErrorMessage(err));
+        } finally {
+            setProfilePhoneVerifying(false);
+        }
+    };
+
+    const handleProfileAdultRequest = async () => {
+        if (!user) return;
+        const phoneNumber = profileAdultPhoneNumber.trim() || user.phone_number || '';
+        if (!phoneNumber) {
+            setProfileActionMessage('성인인증용 휴대폰 번호를 입력해주세요.');
+            return;
+        }
+        if (!profileAdultBirthDate.trim()) {
+            setProfileActionMessage('생년월일을 입력해주세요.');
+            return;
+        }
+
+        try {
+            setProfileAdultSending(true);
+            setProfileActionMessage('');
+            const result = await requestPhoneVerification({ phoneNumber, purpose: 'adult', createdForUserId: user.id });
+            setProfileAdultRequestId(Number(result.verificationId));
+            setProfileAdultPhoneNumber(phoneNumber);
+            setProfileActionMessage(result.debugCode ? `개발용 인증번호: ${result.debugCode}` : '성인인증 인증번호를 전송했습니다.');
+        } catch (err: unknown) {
+            setProfileActionMessage(getErrorMessage(err));
+        } finally {
+            setProfileAdultSending(false);
+        }
+    };
+
+    const handleProfileAdultVerify = async () => {
+        if (!profileAdultRequestId) {
+            setProfileActionMessage('먼저 성인인증 인증번호를 요청해주세요.');
+            return;
+        }
+
+        try {
+            setProfileAdultVerifying(true);
+            setProfileActionMessage('');
+            const verifyResult = await verifyPhoneCode({ verificationId: profileAdultRequestId, code: profileAdultCode.trim() });
+            const completeResult = await completeAdultVerification({
+                verificationToken: verifyResult.verificationToken,
+                birthDate: profileAdultBirthDate,
+            });
+            if (completeResult?.user) {
+                setUser((current) => current ? { ...current, ...(completeResult.user as AuthUser) } : current);
+            } else {
+                const me = await fetchMe();
+                if (me) {
+                    setUser({ ...me, point_balance: Number(me.point_balance ?? 0) });
+                }
+            }
+            setPointData((current) => current ? {
+                ...current,
+                adultVerified: true,
+            } : current);
+            setProfileActionMessage('성인인증이 완료되었습니다.');
+            setProfileAdultCode('');
+            setProfileAdultRequestId(null);
+        } catch (err: unknown) {
+            setProfileActionMessage(getErrorMessage(err));
+        } finally {
+            setProfileAdultVerifying(false);
         }
     };
 
@@ -1337,6 +2069,39 @@ export default function App() {
         pointDataLoadedForUserRef.current = user.id;
         void loadPointData();
     }, [user, pointLoading, loadPointData]);
+
+    useEffect(() => {
+        if (!user) return;
+        setProfilePhoneNumber(user.phone_number || '');
+        setProfileAdultPhoneNumber(user.phone_number || '');
+        setProfileAdultBirthDate(user.birth_date || '');
+        setProfilePhoneRequestId(null);
+        setProfilePhoneCode('');
+        setProfileAdultRequestId(null);
+        setProfileAdultCode('');
+        setProfileActionMessage('');
+    }, [user]);
+
+    useEffect(() => {
+        if (editingMessageId === null) return;
+        const frame = requestAnimationFrame(() => {
+            editingMessageTextareaRef.current?.focus();
+            const valueLength = editingMessageTextareaRef.current?.value.length ?? 0;
+            editingMessageTextareaRef.current?.setSelectionRange(valueLength, valueLength);
+        });
+        return () => cancelAnimationFrame(frame);
+    }, [editingMessageId, storyMessages]);
+
+    useEffect(() => {
+        if (!editedMessageScrollTargetId) return;
+        const target = storyMessageRefs.current[editedMessageScrollTargetId];
+        if (!target) return;
+        const frame = requestAnimationFrame(() => {
+            target.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'center' });
+            setEditedMessageScrollTargetId(null);
+        });
+        return () => cancelAnimationFrame(frame);
+    }, [editedMessageScrollTargetId, storyMessages, view]);
 
     useEffect(() => {
         if (view !== 'admin' || adminTab !== 'points' || adminPointLoading) return;
@@ -1503,7 +2268,7 @@ export default function App() {
     // ── Render helpers ───────────────────────────────────────
     const renderNav = () => (
         <nav className="top-nav">
-            <div className="nav-brand" onClick={() => view !== 'login' && navigate('home')}>
+            <div className="nav-brand" onClick={() => navigate('home')}>
                 <BookOpen size={24} className="text-accent" />
                 <span>Bana<span className="text-accent">Novel 🍌</span></span>
             </div>
@@ -1511,6 +2276,9 @@ export default function App() {
                 <div className="nav-actions">
                     <button className="btn nav-point-pill" onClick={() => navigate('points')}>
                         <Coins size={16} /> 포인트 {formatPointAmount(pointData?.pointBalance ?? user.point_balance)}
+                    </button>
+                    <button className="btn btn-outline" style={{ fontSize: '0.85rem', padding: '0.4rem 0.8rem' }} onClick={() => navigate('profile')}>
+                        마이페이지
                     </button>
                     {user.role === 'admin' && (
                         <button className="btn btn-outline" style={{ fontSize: '0.85rem', padding: '0.4rem 0.8rem' }} onClick={openAdmin}>
@@ -1541,42 +2309,143 @@ export default function App() {
 
     // ── Login view ───────────────────────────────────────────
     const renderLogin = () => (
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', flex: 1 }}>
-            <div className="glass-panel" style={{ width: 380, textAlign: 'center', padding: '3rem' }}>
-                <BookOpen size={48} className="text-accent" style={{ margin: '0 auto 1.5rem' }} />
-                <h1 className="title-font" style={{ fontSize: '1.8rem', marginBottom: '0.5rem' }}>
-                    Novel<span className="text-accent">AI</span>
-                </h1>
-                <p className="text-muted" style={{ marginBottom: '2.5rem' }}>
-                    나만의 AI 캐릭터를 만들고 대화하세요
-                </p>
+        <div className="main-content fade-in" style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 'calc(100vh - 60px)' }}>
+            <div className="login-shell">
+                <div className="glass-panel login-hero">
+                    <BookOpen size={48} className="text-accent" style={{ marginBottom: '1rem' }} />
+                    <span className="badge badge-gold">정식 회원가입 · SMS 인증 · 포인트 충전</span>
+                    <h1 className="title-font" style={{ fontSize: '2rem', margin: '1rem 0 0.75rem' }}>
+                        Novel<span className="text-accent">AI</span>
+                    </h1>
+                    <p className="text-muted" style={{ lineHeight: 1.7, maxWidth: 520 }}>
+                        SNS 로그인은 그대로 두고, 이메일 회원가입과 휴대폰 인증을 추가했습니다.
+                        포인트 충전은 본인인증 후에만 가능하고, 마이페이지에서 성인인증도 진행할 수 있습니다.
+                    </p>
 
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
-                    <a href={oauthUrl.kakao} className="btn" style={{ background: '#FEE500', color: '#3C1E1E', justifyContent: 'center', fontWeight: 600 }}>
-                        카카오로 로그인
-                    </a>
-                    <a href={oauthUrl.naver} className="btn" style={{ background: '#03C75A', color: 'white', justifyContent: 'center', fontWeight: 600 }}>
-                        네이버로 로그인
-                    </a>
-                    <a href={oauthUrl.google} className="btn" style={{ background: 'white', color: '#333', justifyContent: 'center', fontWeight: 600, border: '1px solid #ddd' }}>
-                        구글로 로그인
-                    </a>
-                    <button
-                        type="button"
-                        className="btn"
-                        style={{ background: '#111', color: 'white', justifyContent: 'center', fontWeight: 600 }}
-                        onClick={() => {
-                            localStorage.setItem('token', APPLE_ADMIN_LOCAL_TOKEN);
-                            window.location.assign('/');
-                        }}
-                    >
-                        애플로 관리자 로그인
-                    </button>
+                    <div className="login-feature-grid">
+                        <div className="glass-panel login-feature-card">
+                            <Users size={20} className="text-accent" />
+                            <strong>로컬 회원가입</strong>
+                            <p className="text-muted">SNS 없이 이메일과 비밀번호로 가입할 수 있습니다.</p>
+                        </div>
+                        <div className="glass-panel login-feature-card">
+                            <WalletCards size={20} className="text-accent" />
+                            <strong>본인인증 후 충전</strong>
+                            <p className="text-muted">문자 인증을 통과해야 포인트 충전이 열립니다.</p>
+                        </div>
+                        <div className="glass-panel login-feature-card">
+                            <ShieldAlert size={20} className="text-accent" />
+                            <strong>성인인증</strong>
+                            <p className="text-muted">마이페이지에서 성인 인증 플래그를 설정할 수 있습니다.</p>
+                        </div>
+                    </div>
                 </div>
 
-                <p className="text-muted" style={{ fontSize: '0.78rem', marginTop: '2rem', lineHeight: 1.5 }}>
-                    로그인 시 서비스 이용약관 및 개인정보처리방침에 동의하게 됩니다.
-                </p>
+                <div className="glass-panel login-panel">
+                    <div className="login-toggle-row">
+                        <button className={`btn ${authMode === 'login' ? 'btn-primary' : 'btn-outline'}`} onClick={() => setAuthMode('login')}>
+                            로그인
+                        </button>
+                        <button className={`btn ${authMode === 'signup' ? 'btn-primary' : 'btn-outline'}`} onClick={() => setAuthMode('signup')}>
+                            회원가입
+                        </button>
+                    </div>
+
+                    {authMode === 'login' ? (
+                        <div className="auth-form">
+                            <div className="input-group">
+                                <label>이메일</label>
+                                <input className="input-control" type="email" value={localLoginEmail} onChange={(e) => setLocalLoginEmail(e.target.value)} placeholder="you@example.com" />
+                            </div>
+                            <div className="input-group">
+                                <label>비밀번호</label>
+                                <input className="input-control" type="password" value={localLoginPassword} onChange={(e) => setLocalLoginPassword(e.target.value)} placeholder="비밀번호를 입력하세요" />
+                            </div>
+                            {localLoginError && <p className="text-negative" style={{ marginTop: '-0.25rem' }}>{localLoginError}</p>}
+                            <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleLocalLogin()} disabled={localLoginLoading}>
+                                {localLoginLoading ? '로그인 중...' : '이메일로 로그인'}
+                            </button>
+                            <p className="input-help">SNS 없이 가입한 계정은 여기서 로그인합니다.</p>
+                        </div>
+                    ) : (
+                        <div className="auth-form">
+                            <div className="input-group">
+                                <label>이름</label>
+                                <input className="input-control" value={signupName} onChange={(e) => setSignupName(e.target.value)} placeholder="이름" />
+                            </div>
+                            <div className="input-group">
+                                <label>이메일</label>
+                                <input className="input-control" type="email" value={signupEmail} onChange={(e) => setSignupEmail(e.target.value)} placeholder="you@example.com" />
+                            </div>
+                            <div className="input-group">
+                                <label>비밀번호</label>
+                                <input className="input-control" type="password" value={signupPassword} onChange={(e) => setSignupPassword(e.target.value)} placeholder="최소 8자" />
+                            </div>
+                            <div className="input-group">
+                                <label>생년월일</label>
+                                <input className="input-control" type="date" value={signupBirthDate} onChange={(e) => setSignupBirthDate(e.target.value)} />
+                                <p className="input-help">선택 입력입니다. 마이페이지에서 성인인증을 다시 할 수 있습니다.</p>
+                            </div>
+                            <div className="input-group">
+                                <label>휴대폰 번호</label>
+                                <input className="input-control" value={signupPhoneNumber} onChange={(e) => setSignupPhoneNumber(e.target.value)} placeholder="01012345678" />
+                            </div>
+                            <div className="inline-actions">
+                                <button className="btn btn-outline" type="button" onClick={() => void handleSignupRequestCode()} disabled={signupPhoneSending}>
+                                    {signupPhoneSending ? '전송 중...' : '인증번호 받기'}
+                                </button>
+                                <span className="text-muted" style={{ fontSize: '0.85rem' }}>{signupPhoneRequestId ? '인증번호가 발송됐습니다.' : '먼저 휴대폰 번호를 입력하세요.'}</span>
+                            </div>
+                            <div className="input-group">
+                                <label>인증번호</label>
+                                <input className="input-control" inputMode="numeric" value={signupPhoneCode} onChange={(e) => setSignupPhoneCode(e.target.value)} placeholder="6자리 숫자" />
+                            </div>
+                            <div className="inline-actions">
+                                <button className="btn btn-outline" type="button" onClick={() => void handleSignupVerifyCode()} disabled={signupPhoneVerifying || !signupPhoneRequestId}>
+                                    {signupPhoneVerifying ? '확인 중...' : '번호 확인'}
+                                </button>
+                                <span className="text-muted" style={{ fontSize: '0.85rem' }}>{signupPhoneToken ? '휴대폰 인증 완료' : '인증번호 확인 후 가입할 수 있어요.'}</span>
+                            </div>
+                            {signupInfo && <p className="text-muted">{signupInfo}</p>}
+                            {signupError && <p className="text-negative">{signupError}</p>}
+                            <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleSignupSubmit()} disabled={signupLoading || !signupPhoneToken}>
+                                {signupLoading ? '가입 중...' : '회원가입하기'}
+                            </button>
+                            <p className="input-help">가입 즉시 웰컴 포인트 50P가 지급됩니다.</p>
+                        </div>
+                    )}
+
+                    <div className="login-divider">
+                        <span>또는 SNS로 계속</span>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '0.9rem' }}>
+                        <a href={oauthUrl.kakao} className="btn" style={{ background: '#FEE500', color: '#3C1E1E', justifyContent: 'center', fontWeight: 600 }}>
+                            카카오로 로그인
+                        </a>
+                        <a href={oauthUrl.naver} className="btn" style={{ background: '#03C75A', color: 'white', justifyContent: 'center', fontWeight: 600 }}>
+                            네이버로 로그인
+                        </a>
+                        <a href={oauthUrl.google} className="btn" style={{ background: 'white', color: '#333', justifyContent: 'center', fontWeight: 600, border: '1px solid #ddd' }}>
+                            구글로 로그인
+                        </a>
+                        <button
+                            type="button"
+                            className="btn"
+                            style={{ background: '#111', color: 'white', justifyContent: 'center', fontWeight: 600 }}
+                            onClick={() => {
+                                localStorage.setItem('token', APPLE_ADMIN_LOCAL_TOKEN);
+                                window.location.assign('/');
+                            }}
+                        >
+                            애플로 관리자 로그인
+                        </button>
+                    </div>
+
+                    <p className="text-muted" style={{ fontSize: '0.78rem', marginTop: '1.5rem', lineHeight: 1.5, textAlign: 'center' }}>
+                        로그인 시 서비스 이용약관 및 개인정보처리방침에 동의하게 됩니다.
+                    </p>
+                </div>
             </div>
         </div>
     );
@@ -1642,6 +2511,9 @@ export default function App() {
                             <div style={{ display: 'flex', gap: '0.6rem', marginTop: '0.85rem', flexWrap: 'wrap' }}>
                                 <button className="btn btn-outline" style={{ flex: 1 }} onClick={() => navigate('points')}>
                                     포인트
+                                </button>
+                                <button className="btn btn-outline" style={{ flex: 1 }} onClick={() => navigate('profile')}>
+                                    마이페이지
                                 </button>
                                 <button className="btn btn-outline" style={{ flex: 1 }} onClick={() => void openCommunity()}>
                                     커뮤니티
@@ -1924,32 +2796,9 @@ export default function App() {
         const chatCost = pointData?.chatCost ?? getChatCostForUser(user);
         const storyLimit = pointData?.storyLimit ?? getStoryLimitForUser(user);
         const storyCount = pointData?.storyCount ?? stories.length;
+        const canCharge = Boolean(pointData?.canCharge ?? user?.phone_verified_at ?? user?.role === 'admin');
         const quickPackages = [100, 300, 500, 1000] as const;
         const transactions = pointData?.recentTransactions || [];
-        const formatTransactionLabel = (type: PointTransactionType) => {
-            switch (type) {
-                case 'welcome': return '웰컴';
-                case 'topup': return '충전';
-                case 'chat': return '대화 차감';
-                case 'admin_grant': return '관리자 지급';
-                case 'admin_deduct': return '관리자 회수';
-                case 'refund': return '환불';
-                default: return '조정';
-            }
-        };
-        const formatTxDate = (value: string) => {
-            const date = new Date(value);
-            return Number.isNaN(date.getTime())
-                ? '-'
-                : date.toLocaleString('ko-KR', {
-                    year: 'numeric',
-                    month: '2-digit',
-                    day: '2-digit',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                });
-        };
-
         return (
             <div className="main-content fade-in">
                 <div className="admin-hero glass-panel" style={{ marginBottom: '1rem' }}>
@@ -1997,6 +2846,18 @@ export default function App() {
                     </div>
                 </div>
 
+                {!canCharge && (
+                    <div className="glass-panel" style={{ marginBottom: '1rem', borderColor: 'rgba(244, 180, 0, 0.35)', background: 'rgba(244, 180, 0, 0.06)' }}>
+                        <strong>본인인증이 필요합니다</strong>
+                        <p className="text-muted" style={{ marginTop: '0.35rem' }}>
+                            포인트 충전은 휴대폰 본인인증 후에만 가능합니다. 마이페이지에서 인증을 먼저 완료해주세요.
+                        </p>
+                        <button className="btn btn-outline" style={{ marginTop: '0.9rem' }} onClick={() => navigate('profile')}>
+                            마이페이지로 이동
+                        </button>
+                    </div>
+                )}
+
                 <div className="points-layout">
                     <div className="glass-panel points-panel">
                         <div className="section-title-row">
@@ -2036,7 +2897,7 @@ export default function App() {
                             className="btn btn-primary"
                             style={{ width: '100%', justifyContent: 'center' }}
                             onClick={() => void chargePoints(pointChargeAmount, `포인트 충전 ${formatPointAmount(pointChargeAmount)}`)}
-                            disabled={pointLoading}
+                            disabled={pointLoading || !canCharge}
                         >
                             <CreditCard size={16} /> {formatPointAmount(pointChargeAmount)} 충전하기
                         </button>
@@ -2071,13 +2932,13 @@ export default function App() {
                                         <div key={tx.id} className="points-ledger-item">
                                             <div>
                                                 <div className="points-ledger-head">
-                                                    <strong>{formatTransactionLabel(tx.transactionType)}</strong>
+                                                    <strong>{formatPointTransactionTypeLabel(tx.transactionType)}</strong>
                                                     <span className={isPositive ? 'text-positive' : 'text-negative'}>{amountLabel}</span>
                                                 </div>
                                                 <p className="text-muted points-ledger-note">{tx.note || '세부 메모 없음'}</p>
                                             </div>
                                             <div className="points-ledger-meta">
-                                                <span>{formatTxDate(tx.createdAt)}</span>
+                                                <span>{formatKoreanDateTime(tx.createdAt)}</span>
                                                 <span>잔액 {formatPointAmount(tx.balanceAfter)}</span>
                                             </div>
                                         </div>
@@ -2085,6 +2946,435 @@ export default function App() {
                                 })}
                             </div>
                         )}
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    const renderBinding = () => {
+        if (!user) {
+            return (
+                <div className="main-content fade-in" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60vh' }}>
+                    <div className="glass-panel" style={{ width: 'min(100%, 420px)', textAlign: 'center', padding: '2.5rem' }}>
+                        <ScrollText size={48} className="text-accent" style={{ margin: '0 auto 1rem' }} />
+                        <h1 className="title-font" style={{ fontSize: '1.6rem', marginBottom: '0.5rem' }}>로그인이 필요합니다</h1>
+                        <p className="text-muted" style={{ lineHeight: 1.7 }}>
+                            제본용 출력은 로그인 후 이용할 수 있습니다.
+                        </p>
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '1.5rem' }} onClick={() => navigate('login')}>
+                            로그인하기
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        const preview = bindingPreview;
+        const bindingMessages = storyMessages.length ? storyMessages : (preview?.messages || storyMessages);
+        const bindingViewerSettings = DEFAULT_BINDING_VIEWER_SETTINGS;
+        const bindingFontSize = bindingViewerSettings.fontSize || DEFAULT_BINDING_VIEWER_SETTINGS.fontSize || readerSettings.fontSize;
+        const bindingLineHeight = bindingViewerSettings.lineHeight || DEFAULT_BINDING_VIEWER_SETTINGS.lineHeight || readerSettings.lineHeight;
+        const bindingFontFamily = bindingViewerSettings.fontFamily || DEFAULT_BINDING_VIEWER_SETTINGS.fontFamily || readerSettings.fontFamily;
+        const bindingPreviewOptions = preview?.options || bindingOptions;
+        const bindingPages: BindingPage[] = buildBindingPages({
+            title: preview?.title || activeStory?.title || '',
+            background: preview?.background || activeStory?.background || '',
+            environment: preview?.environment || activeStory?.environment || '',
+            messages: bindingMessages,
+            viewerSettings: bindingViewerSettings,
+            options: bindingPreviewOptions,
+        }) as BindingPage[];
+        const bindingPageCount = bindingPages.length || estimateBindingPageCount({
+            title: preview?.title || activeStory?.title || '',
+            background: preview?.background || activeStory?.background || '',
+            environment: preview?.environment || activeStory?.environment || '',
+            messages: bindingMessages,
+            viewerSettings: bindingViewerSettings,
+            options: bindingPreviewOptions,
+        });
+        const bindingCost = preview?.cost || bindingPageCount;
+        const remainingPoints = preview?.remainingPoints ?? (pointData?.pointBalance ?? user?.point_balance ?? 0);
+        const bindingFixedTypeSpec = `${bindingFontFamily} · ${bindingFontSize.toFixed(0)}px`;
+
+        const renderBindingCover = () => {
+            const coverImage = preview?.coverImageUrl || activeStory?.cover_image_url || null;
+            const title = preview?.title || activeStory?.title || '제본 미리보기';
+            const background = preview?.background || activeStory?.background || '배경 미설정';
+            const authorName = preview?.authorName || user?.name || '작성자 미상';
+            const createdAt = preview?.createdAt || activeStory?.created_at || '';
+
+            return (
+                <div className="binding-cover-layout">
+                    <div
+                        className={`binding-cover-art ${coverImage ? '' : 'is-placeholder'}`}
+                        style={{
+                            backgroundImage: coverImage
+                                ? `linear-gradient(180deg, rgba(10,10,14,0.18), rgba(10,10,14,0.55)), url(${coverImage})`
+                                : 'linear-gradient(180deg, #473a29 0%, #231b13 100%)',
+                        }}
+                    >
+                        {!coverImage && <span className="binding-cover-placeholder">표지 없음</span>}
+                        <div className="binding-cover-overlay">
+                            <span className="badge badge-gold">A5 제본 표지</span>
+                            <h2 className="binding-cover-title">{title}</h2>
+                            <p className="binding-cover-author">{authorName}</p>
+                        </div>
+                    </div>
+
+                    <div className="binding-cover-meta">
+                        <div className="binding-cover-meta-grid">
+                            <div>
+                                <span>총 페이지</span>
+                                <strong>{bindingPageCount}장</strong>
+                            </div>
+                            <div>
+                                <span>예상 차감</span>
+                                <strong>{formatPointAmount(bindingCost)}</strong>
+                            </div>
+                            <div>
+                                <span>형식</span>
+                                <strong>A5</strong>
+                            </div>
+                            <div>
+                                <span>기준</span>
+                                <strong>표지 포함</strong>
+                            </div>
+                        </div>
+                        <div className="binding-cover-note">
+                            <strong>{background}</strong>
+                            <p>{createdAt ? `${formatKoreanDateTime(createdAt)}에 생성된 이야기입니다.` : '생성일 정보가 없습니다.'}</p>
+                        </div>
+                    </div>
+                    <div className="binding-print-page-number">{1}</div>
+                </div>
+            );
+        };
+
+        const renderBindingContentPage = (page: BindingPage, config: { badge: string; title: string; detailLabel: string; bodyClass?: string; compact?: boolean; }) => {
+            const isCompact = Boolean(config.compact);
+            return (
+                <div className={`binding-body-layout ${config.bodyClass || ''} ${isCompact ? 'is-compact' : ''}`}>
+                    {!isCompact && (
+                        <div className="binding-sheet-head">
+                            <div>
+                                <span className={`badge ${config.badge}`}>{config.title}</span>
+                                <h3 className="binding-page-title">{preview?.title || activeStory?.title || '제본 미리보기'}</h3>
+                            </div>
+                            <div className="binding-sheet-meta">
+                                <span>페이지 {page.number} / {bindingPageCount}</span>
+                                <span>A5 · {config.detailLabel}</span>
+                            </div>
+                        </div>
+                    )}
+
+                    <div
+                        className={`binding-manuscript ${isCompact ? 'binding-manuscript-book' : ''}`}
+                        onContextMenu={(e) => e.preventDefault()}
+                        onCopy={(e) => e.preventDefault()}
+                        onDragStart={(e) => e.preventDefault()}
+                    >
+                        {page.blocks.length === 0 ? (
+                            <div className="binding-empty-state">
+                                본문 내용이 없습니다.
+                            </div>
+                        ) : (
+                            page.blocks.map((block) => (
+                                <div key={block.id} className={`binding-message binding-message-${block.role}`}>
+                                    <span>{block.content}</span>
+                                </div>
+                            ))
+                        )}
+                    </div>
+
+                    {!isCompact && (
+                        <div className="binding-page-footer">
+                            <span>{config.detailLabel}</span>
+                            <span>{page.number} / {bindingPageCount}</span>
+                        </div>
+                    )}
+                    <div className="binding-print-page-number">{page.number}</div>
+                </div>
+            );
+        };
+
+        const renderBindingPageByKind = (page: BindingPage) => {
+            if (page.kind === 'cover') {
+                return renderBindingCover();
+            }
+
+            if (page.kind === 'author_note') {
+                return renderBindingContentPage(page, {
+                    badge: 'badge-gold',
+                    title: '작가의 말',
+                    detailLabel: '작가의 말',
+                    bodyClass: 'is-frontmatter',
+                });
+            }
+
+            return renderBindingContentPage(page, {
+                badge: 'badge-green',
+                title: '본문',
+                detailLabel: '본문',
+                compact: true,
+            });
+        };
+
+        const getBindingPageCaption = (page: BindingPage) => {
+            if (page.kind === 'cover') return '표지';
+            if (page.kind === 'author_note') return '작가의 말';
+            return `${page.number} / ${bindingPageCount}`;
+        };
+
+        return (
+            <div className="main-content fade-in binding-shell">
+                <div className="glass-panel binding-toolbar">
+                    <div className="binding-toolbar-copy">
+                        <div className="admin-hero-title">
+                        <ScrollText size={22} className="text-accent" />
+                            <h1 className="title-font" style={{ fontSize: '1.6rem' }}>A5 제본 미리보기</h1>
+                        </div>
+                        <p className="text-muted" style={{ marginTop: '0.4rem', lineHeight: 1.6 }}>
+                            선택한 총 {bindingPageCount}장 · 예상 차감 {formatPointAmount(bindingCost)} · 현재 잔액 {formatPointAmount(remainingPoints)}
+                        </p>
+                        <div className="binding-toolbar-note">
+                            <span className="badge badge-gold">고정 설정</span>
+                            <p>
+                                제본용 출력은 <strong>{bindingFixedTypeSpec}</strong>로 고정됩니다. 화면 설정과 무관하게 책 출력에 맞는 형식으로만 나갑니다.
+                            </p>
+                        </div>
+                    </div>
+                    <div className="binding-toolbar-actions">
+                        <button className="btn btn-outline" onClick={() => navigate('chat')}>
+                            <ChevronLeft size={16} /> 읽기 화면
+                        </button>
+                        <button className="btn btn-primary" onClick={handleBindingPrint} disabled={bindingMessages.length === 0 || bindingPageCount === 0}>
+                            <ScrollText size={16} /> 제본하기
+                        </button>
+                    </div>
+                </div>
+
+                <div className="binding-grid">
+                    <div className="binding-pages-list">
+                        {bindingPages.map((page, index) => (
+                            <div key={page.number} className="binding-page-shell">
+                                <div
+                                    ref={index === 0 ? bindingPrintRef : undefined}
+                                    className={`binding-sheet ${page.kind === 'cover' ? 'is-cover' : ''}`}
+                                    style={{
+                                        fontFamily: bindingFontFamily,
+                                        fontSize: `${bindingFontSize}px`,
+                                        lineHeight: bindingLineHeight,
+                                    }}
+                                >
+                                    {renderBindingPageByKind(page)}
+                                </div>
+                                <div className="binding-page-caption">{getBindingPageCaption(page)} · {page.number} / {bindingPageCount}</div>
+                            </div>
+                        ))}
+                    </div>
+
+                    <div className="binding-sidebar">
+                        <div className="glass-panel binding-info-card">
+                            <span className="badge badge-green">결제 요약</span>
+                            <div className="binding-stat-grid">
+                                <div>
+                                    <span>선택한 총 페이지</span>
+                                    <strong>{bindingPageCount}장</strong>
+                                </div>
+                                <div>
+                                    <span>예상 차감</span>
+                                    <strong>{formatPointAmount(bindingCost)}</strong>
+                                </div>
+                                <div>
+                                    <span>현재 잔액</span>
+                                    <strong>{formatPointAmount(remainingPoints)}</strong>
+                                </div>
+                                <div>
+                                    <span>제본 형식</span>
+                                    <strong>A5</strong>
+                                </div>
+                            </div>
+                            <p className="text-muted" style={{ marginTop: '0.9rem', lineHeight: 1.6 }}>
+                                제본 차감은 선택한 표지, 작가의 말, 본문을 모두 합한 총 페이지당 1포인트로 처리됩니다. 인쇄 전에는 내용을 다시 확인해 주세요.
+                            </p>
+                        </div>
+
+                        <div className="glass-panel binding-note-card">
+                            <strong>안내</strong>
+                            <p className="text-muted" style={{ marginTop: '0.45rem', lineHeight: 1.6 }}>
+                                이 화면은 제본용 출력 전용입니다. 브라우저 인쇄 기능을 사용하면 A5 크기로 저장할 수 있고, 표지와 본문이 페이지 단위로 분리됩니다.
+                            </p>
+                            <button className="btn btn-outline" style={{ width: '100%', marginTop: '0.9rem' }} onClick={() => navigate('points')}>
+                                포인트 충전
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        );
+    };
+
+    const renderProfile = () => {
+        if (!user) {
+            return (
+                <div className="main-content fade-in" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '60vh' }}>
+                    <div className="glass-panel" style={{ width: 'min(100%, 420px)', textAlign: 'center', padding: '2.5rem' }}>
+                        <Users size={48} className="text-accent" style={{ margin: '0 auto 1rem' }} />
+                        <h1 className="title-font" style={{ fontSize: '1.6rem', marginBottom: '0.5rem' }}>로그인이 필요합니다</h1>
+                        <p className="text-muted" style={{ lineHeight: 1.7 }}>
+                            마이페이지에서는 본인인증과 성인인증을 진행할 수 있습니다.
+                        </p>
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center', marginTop: '1.5rem' }} onClick={() => navigate('login')}>
+                            로그인하기
+                        </button>
+                    </div>
+                </div>
+            );
+        }
+
+        const identityVerified = Boolean(pointData?.identityVerified ?? user.phone_verified_at);
+        const adultVerified = Boolean(pointData?.adultVerified ?? user.is_adult);
+
+        return (
+            <div className="main-content fade-in">
+                <div className="admin-hero glass-panel" style={{ marginBottom: '1rem' }}>
+                    <div>
+                        <div className="admin-hero-title">
+                            <Users size={22} className="text-accent" />
+                            <h1 className="title-font" style={{ fontSize: '1.6rem' }}>마이페이지</h1>
+                        </div>
+                        <p className="text-muted" style={{ marginTop: '0.5rem' }}>
+                            계정 정보, 본인인증, 성인인증 상태를 한 곳에서 관리하세요.
+                        </p>
+                    </div>
+                    <div className="admin-hero-actions">
+                        <button className="btn btn-outline" onClick={() => navigate('home')}>
+                            <ChevronLeft size={16} /> 홈으로
+                        </button>
+                        <button className="btn btn-primary" onClick={() => navigate('points')}>
+                            <Coins size={16} /> 포인트
+                        </button>
+                    </div>
+                </div>
+
+                {profileActionMessage && (
+                    <div className="glass-panel" style={{ marginBottom: '1rem', borderColor: 'rgba(244, 180, 0, 0.35)' }}>
+                        <strong>안내</strong>
+                        <p className="text-muted" style={{ marginTop: '0.35rem' }}>{profileActionMessage}</p>
+                    </div>
+                )}
+
+                <div className="profile-summary-grid">
+                    <div className="glass-panel profile-summary-card">
+                        <span className="badge badge-gold">기본 정보</span>
+                        <h2 className="title-font" style={{ marginTop: '0.75rem', fontSize: '1.4rem' }}>{user.name}</h2>
+                        <p className="text-muted">{user.email || '이메일 없음'}</p>
+                        <div className="profile-badge-row">
+                            <span className={`badge ${user.role === 'admin' ? 'badge-red' : 'badge-green'}`}>{user.role}</span>
+                            <span className="badge badge-green">{user.provider || 'local'}</span>
+                            <span className={`badge ${identityVerified ? 'badge-green' : 'badge-red'}`}>{identityVerified ? '본인인증 완료' : '본인인증 필요'}</span>
+                            <span className={`badge ${adultVerified ? 'badge-green' : 'badge-red'}`}>{adultVerified ? '성인인증 완료' : '성인인증 필요'}</span>
+                        </div>
+                        <div className="profile-meta-list">
+                            <div><span>휴대폰</span><strong>{user.phone_number || '미등록'}</strong></div>
+                            <div><span>가입 포인트</span><strong>{formatPointAmount(pointData?.pointBalance ?? user.point_balance)}</strong></div>
+                            <div><span>대화 비용</span><strong>{formatPointAmount(pointData?.chatCost ?? getChatCostForUser(user))}</strong></div>
+                            <div><span>이야기 한도</span><strong>{pointData?.storyCount ?? stories.length} / {pointData?.storyLimit ?? getStoryLimitForUser(user)}</strong></div>
+                        </div>
+                    </div>
+
+                    <div className="glass-panel profile-summary-card">
+                        <span className="badge badge-green">본인인증</span>
+                        <h3 className="section-title" style={{ marginTop: '0.75rem' }}>포인트 충전 전 확인</h3>
+                        <p className="text-muted">휴대폰 인증을 해야 포인트 충전이 열립니다.</p>
+
+                        <div className="input-group">
+                            <label>휴대폰 번호</label>
+                            <input
+                                className="input-control"
+                                value={profilePhoneNumber}
+                                onChange={(e) => setProfilePhoneNumber(e.target.value)}
+                                placeholder={user.phone_number || '01012345678'}
+                                disabled={identityVerified}
+                            />
+                        </div>
+
+                        <div className="inline-actions">
+                            <button className="btn btn-outline" type="button" onClick={() => void handleProfilePhoneRequest()} disabled={profilePhoneSending || identityVerified}>
+                                {profilePhoneSending ? '전송 중...' : identityVerified ? '완료됨' : '인증번호 받기'}
+                            </button>
+                            <span className="text-muted" style={{ fontSize: '0.85rem' }}>
+                                {identityVerified ? '이미 본인인증이 완료되었습니다.' : '문자 인증 후 포인트 충전이 가능합니다.'}
+                            </span>
+                        </div>
+
+                        <div className="input-group">
+                            <label>인증번호</label>
+                            <input
+                                className="input-control"
+                                value={profilePhoneCode}
+                                onChange={(e) => setProfilePhoneCode(e.target.value)}
+                                placeholder="6자리 숫자"
+                                disabled={identityVerified}
+                            />
+                        </div>
+
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleProfilePhoneVerify()} disabled={profilePhoneVerifying || identityVerified || !profilePhoneRequestId}>
+                            {profilePhoneVerifying ? '확인 중...' : identityVerified ? '본인인증 완료' : '번호 확인'}
+                        </button>
+                    </div>
+
+                    <div className="glass-panel profile-summary-card">
+                        <span className="badge badge-gold">성인인증</span>
+                        <h3 className="section-title" style={{ marginTop: '0.75rem' }}>마이페이지에서 설정</h3>
+                        <p className="text-muted">성인 여부는 생년월일과 휴대폰 인증을 함께 확인합니다.</p>
+
+                        <div className="input-group">
+                            <label>생년월일</label>
+                            <input
+                                className="input-control"
+                                type="date"
+                                value={profileAdultBirthDate}
+                                onChange={(e) => setProfileAdultBirthDate(e.target.value)}
+                                disabled={adultVerified}
+                            />
+                        </div>
+
+                        <div className="input-group">
+                            <label>휴대폰 번호</label>
+                            <input
+                                className="input-control"
+                                value={profileAdultPhoneNumber}
+                                onChange={(e) => setProfileAdultPhoneNumber(e.target.value)}
+                                placeholder={user.phone_number || '01012345678'}
+                                disabled={adultVerified}
+                            />
+                        </div>
+
+                        <div className="inline-actions">
+                            <button className="btn btn-outline" type="button" onClick={() => void handleProfileAdultRequest()} disabled={profileAdultSending || adultVerified}>
+                                {profileAdultSending ? '전송 중...' : adultVerified ? '완료됨' : '성인인증번호 받기'}
+                            </button>
+                            <span className="text-muted" style={{ fontSize: '0.85rem' }}>
+                                {adultVerified ? '성인인증이 완료되었습니다.' : '인증 후 성인 콘텐츠 공개 플래그가 활성화됩니다.'}
+                            </span>
+                        </div>
+
+                        <div className="input-group">
+                            <label>인증번호</label>
+                            <input
+                                className="input-control"
+                                value={profileAdultCode}
+                                onChange={(e) => setProfileAdultCode(e.target.value)}
+                                placeholder="6자리 숫자"
+                                disabled={adultVerified}
+                            />
+                        </div>
+
+                        <button className="btn btn-primary" style={{ width: '100%', justifyContent: 'center' }} onClick={() => void handleProfileAdultVerify()} disabled={profileAdultVerifying || adultVerified || !profileAdultRequestId}>
+                            {profileAdultVerifying ? '확인 중...' : adultVerified ? '성인인증 완료' : '성인 인증 완료'}
+                        </button>
                     </div>
                 </div>
             </div>
@@ -2611,8 +3901,109 @@ export default function App() {
                     const regex = new RegExp(`(${escapeRegExp(escapedName)})`, 'g');
                     htmlContent = htmlContent.replace(regex, '<span class="character-name-highlight">$1</span>');
                 });
-            }
+        }
         return <span style={{ color: aiColorStr, transition: 'color 0.2s' }} dangerouslySetInnerHTML={{ __html: htmlContent }}></span>;
+        };
+
+        const blockReaderProtection = (event: { preventDefault: () => void; target: EventTarget | null }) => {
+            const target = event.target as HTMLElement | null;
+            if (target && target.closest('textarea, input, button, a, select, option, [contenteditable="true"]')) {
+                return;
+            }
+            event.preventDefault();
+        };
+
+        const bindingQuoteEstimatedPages = estimateBindingPageCount({
+            title: activeStory?.title || '',
+            background: activeStory?.background || '',
+            environment: activeStory?.environment || '',
+            messages: storyMessages,
+            viewerSettings: readerSettings,
+            options: bindingOptions,
+        });
+        const bindingQuotePreviewOptions = bindingPreview?.options || bindingOptions;
+        const bindingQuoteAuthorNoteLimit = Math.max(300, Math.min(1200, Math.floor(getBindingBodyBudget(DEFAULT_BINDING_VIEWER_SETTINGS) * 0.7)));
+        const bindingQuoteCost = bindingPreview?.cost ?? bindingQuoteEstimatedPages;
+        const bindingQuoteBalance = pointData?.pointBalance ?? user?.point_balance ?? 0;
+        const bindingQuoteRemaining = bindingQuoteBalance - bindingQuoteCost;
+
+        const setStoryMessageRef = (messageId: number) => (node: HTMLDivElement | null) => {
+            if (node) {
+                storyMessageRefs.current[messageId] = node;
+            } else {
+                delete storyMessageRefs.current[messageId];
+            }
+        };
+
+        const renderReaderMessage = (msg: StoryMessage) => {
+            const isEditable = canEditStoryMessage(msg);
+            const isEditing = editingMessageId === msg.id;
+
+            if (msg.role === 'user') {
+                return (
+                    <div key={msg.id} className="reader-message reader-message-user">
+                        <span style={{ color: userColorStr, transition: 'color 0.2s', opacity: 0.8, fontSize: '0.9em' }}>
+                            ➔ {msg.content}
+                        </span>
+                    </div>
+                );
+            }
+
+            return (
+                <div
+                    key={msg.id}
+                    ref={setStoryMessageRef(msg.id)}
+                    className={`reader-message reader-message-assistant ${isEditable ? 'is-editable' : ''} ${isEditing ? 'is-editing' : ''}`}
+                >
+                    {!isEditing ? (
+                        <>
+                            {isEditable && (
+                                <button
+                                    type="button"
+                                    className="reader-message-edit-trigger"
+                                    onClick={() => beginEditStoryMessage(msg)}
+                                    aria-label="AI 글 수정"
+                                >
+                                    수정
+                                </button>
+                            )}
+                            <div className="reader-message-body">
+                                {renderMessageContent(msg.content)}
+                            </div>
+                        </>
+                    ) : (
+                        <div className="reader-message-editor">
+                            <textarea
+                                ref={editingMessageTextareaRef}
+                                className="reader-message-textarea input-control"
+                                value={editingMessageDraft}
+                                onChange={(e) => setEditingMessageDraft(e.target.value)}
+                                disabled={editingMessageSaving}
+                                style={{ color: aiColorStr }}
+                                aria-label="AI 글 수정"
+                            />
+                            <div className="reader-message-editor-actions">
+                                <button
+                                    type="button"
+                                    className="btn btn-outline reader-message-cancel-btn"
+                                    onClick={cancelEditStoryMessage}
+                                    disabled={editingMessageSaving}
+                                >
+                                    취소
+                                </button>
+                                <button
+                                    type="button"
+                                    className="btn btn-primary"
+                                    onClick={() => void saveEditedStoryMessage()}
+                                    disabled={editingMessageSaving}
+                                >
+                                    {editingMessageSaving ? '저장 중...' : '완료'}
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
         };
 
         return (
@@ -2631,6 +4022,15 @@ export default function App() {
                             <Coins size={14} /> 포인트 {formatPointAmount(pointData?.pointBalance ?? user?.point_balance ?? 0)}
                         </button>
                         <span className="badge badge-gold">대화 {formatPointAmount(pointData?.chatCost ?? getChatCostForUser(user))}</span>
+                        <button
+                            className="btn btn-outline"
+                            style={{ padding: '0.42rem 0.8rem', fontSize: '0.78rem' }}
+                            onClick={openBindingQuote}
+                            disabled={!activeStory || storyMessages.length === 0}
+                            title={!activeStory || storyMessages.length === 0 ? '이야기를 연 뒤 사용할 수 있습니다.' : '제본용 A5 출력'}
+                        >
+                            <ScrollText size={14} /> 제본용 출력
+                        </button>
                         <div style={{ display: 'flex', gap: '0.5rem', position: 'relative' }}>
                         <button className="btn-icon" onClick={() => setShowSettingsDrawer(!showSettingsDrawer)}>
                             <Settings size={20} />
@@ -2737,7 +4137,7 @@ export default function App() {
                         {useVerticalReader ? (
                             <div className={`book-text-tall ${isCompactReader ? 'is-compact-reader' : ''}`} ref={bookRef} style={{
                                 fontFamily: readerSettings.fontFamily, fontSize: `${readerSettings.fontSize}px`, lineHeight: readerSettings.lineHeight
-                            }}>
+                            }} onContextMenu={blockReaderProtection} onCopy={blockReaderProtection} onDragStart={blockReaderProtection}>
                                 {readerSettings.hideUserText && storyMessages.length > 0 && visibleStoryMessages.length === 0 && (
                                     <div className="reader-hidden-note">
                                         내가 쓴 글은 숨김 상태입니다. AI가 작성한 글만 표시됩니다.
@@ -2748,15 +4148,7 @@ export default function App() {
                                         새로운 이야기가 시작됩니다. 지시를 입력하거나 캐릭터의 대사를 작성해 보세요.
                                     </div>
                                 )}
-                                {visibleStoryMessages.map(msg => (
-                                    <p key={msg.id} style={{ marginBottom: '1.5rem', textAlign: 'justify' }}>
-                                        {msg.role === 'user' ? (
-                                            <span style={{ color: userColorStr, transition: 'color 0.2s', opacity: 0.8, fontSize: '0.9em' }}>➔ {msg.content}</span>
-                                        ) : (
-                                            renderMessageContent(msg.content)
-                                        )}
-                                    </p>
-                                ))}
+                                {visibleStoryMessages.map(renderReaderMessage)}
                                 {isSending && <p className="text-muted" style={{ fontStyle: 'italic' }}>✍️ 글을 쓰는 중입니다...</p>}
                                 <div ref={chatBottomRef} />
                             </div>
@@ -2767,7 +4159,7 @@ export default function App() {
                                 columnFill: 'auto', columnGap: isCompactReader ? '2rem' : '4rem',
                                 padding: isCompactReader ? '1.25rem 1.25rem' : '3rem 4rem',
                                 height: '100%'
-                            }}>
+                            }} onContextMenu={blockReaderProtection} onCopy={blockReaderProtection} onDragStart={blockReaderProtection}>
                                 {readerSettings.hideUserText && storyMessages.length > 0 && visibleStoryMessages.length === 0 && (
                                     <div className="reader-hidden-note">
                                         내가 쓴 글은 숨김 상태입니다. AI가 작성한 글만 표시됩니다.
@@ -2778,15 +4170,7 @@ export default function App() {
                                         새로운 이야기가 시작됩니다...
                                     </div>
                                 )}
-                                {visibleStoryMessages.map(msg => (
-                                    <p key={msg.id} style={{ marginBottom: '1.5rem' }}>
-                                        {msg.role === 'user' ? (
-                                            <span style={{ color: userColorStr, transition: 'color 0.2s', opacity: 0.8, fontSize: '0.9em' }}>➔ {msg.content}</span>
-                                        ) : (
-                                            renderMessageContent(msg.content)
-                                        )}
-                                    </p>
-                                ))}
+                                {visibleStoryMessages.map(renderReaderMessage)}
                                 {isSending && <p className="text-muted" style={{ fontStyle: 'italic' }}>✍️ 글을 쓰는 중입니다...</p>}
                             </div>
                         )}
@@ -2824,7 +4208,7 @@ export default function App() {
                             </div>
                             <h2 className="title-font">포인트가 부족합니다</h2>
                             <p className="text-muted" style={{ lineHeight: 1.7, textAlign: 'center' }}>
-                                대화를 위한 포인트가 부족합니다 충전하시겠습니까?
+                                {insufficientPointMessage}
                             </p>
                             <div className="points-modal-summary">
                                 <div>
@@ -2846,6 +4230,101 @@ export default function App() {
                                     }}
                                 >
                                     충전하러 가기
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {bindingQuoteOpen && (
+                    <div className="modal-overlay" onClick={closeBindingQuote}>
+                        <div className="modal-content points-modal binding-quote-modal" onClick={(e) => e.stopPropagation()}>
+                            <div className="points-modal-icon">
+                                <ScrollText size={26} />
+                            </div>
+                            <span className="badge badge-gold">A5 제본 출력</span>
+                            <h2 className="title-font">제본용 포인트 안내</h2>
+                            <p className="text-muted" style={{ lineHeight: 1.7, textAlign: 'center' }}>
+                                선택한 제본 페이지 합계당 1포인트가 차감됩니다. 아래 예상 차감 금액을 확인하고 제본 페이지로 이동할 수 있습니다.
+                            </p>
+                            <div className="points-modal-summary binding-quote-summary">
+                                <div>
+                                    <span>선택한 총 페이지</span>
+                                    <strong>{bindingQuoteEstimatedPages}장</strong>
+                                </div>
+                                <div>
+                                    <span>현재 잔액</span>
+                                    <strong>{formatPointAmount(bindingQuoteBalance)}</strong>
+                                </div>
+                                <div>
+                                    <span>예상 차감</span>
+                                    <strong>{formatPointAmount(bindingQuoteCost)}</strong>
+                                </div>
+                            </div>
+                            <div className="binding-option-panel">
+                                <label className="binding-option-row">
+                                    <input
+                                        type="checkbox"
+                                        checked={bindingQuotePreviewOptions.includeCover}
+                                        onChange={(e) => updateBindingOption({ includeCover: e.target.checked })}
+                                    />
+                                    <span>표지 추가</span>
+                                    <strong>+1P</strong>
+                                </label>
+                                <label className="binding-option-row">
+                                    <input
+                                        type="checkbox"
+                                        checked={bindingQuotePreviewOptions.includeUserText}
+                                        onChange={(e) => updateBindingOption({ includeUserText: e.target.checked })}
+                                    />
+                                    <span>사용자 텍스트 포함</span>
+                                    <strong>기본 포함</strong>
+                                </label>
+                                <label className="binding-option-row">
+                                    <input
+                                        type="checkbox"
+                                        checked={bindingQuotePreviewOptions.includeAuthorNote}
+                                        onChange={(e) => updateBindingOption({ includeAuthorNote: e.target.checked })}
+                                    />
+                                    <span>작가의 말 추가</span>
+                                    <strong>+1P</strong>
+                                </label>
+                            </div>
+                            {bindingQuoteEstimatedPages === 0 && (
+                                <p className="text-negative" style={{ textAlign: 'center', fontSize: '0.82rem' }}>
+                                    출력할 페이지가 없습니다. 사용자 텍스트 포함 또는 제본 옵션을 다시 선택해 주세요.
+                                </p>
+                            )}
+                            {bindingQuotePreviewOptions.includeAuthorNote && (
+                                <div className="input-group" style={{ width: '100%' }}>
+                                    <label>작가의 말</label>
+                                    <textarea
+                                        className="input-control binding-author-note-input"
+                                        value={bindingQuotePreviewOptions.authorNoteText}
+                                        maxLength={bindingQuoteAuthorNoteLimit}
+                                        onChange={(e) => updateBindingOption({ authorNoteText: e.target.value })}
+                                        placeholder="출력할 작가의 말을 입력하세요."
+                                    />
+                                    <p className="input-help" style={{ marginTop: '0.4rem' }}>
+                                        최대 {bindingQuoteAuthorNoteLimit}자까지 입력할 수 있습니다. 선택 시 1포인트가 추가 차감됩니다.
+                                    </p>
+                                </div>
+                            )}
+                            <p className={`text-muted${bindingQuoteRemaining < 0 ? ' text-negative' : ''}`} style={{ textAlign: 'center', fontSize: '0.85rem' }}>
+                                {bindingQuoteRemaining < 0
+                                    ? `포인트가 ${formatPointAmount(Math.abs(bindingQuoteRemaining))} 부족합니다. 충전이 필요합니다.`
+                                    : `차감 후 예상 잔액: ${formatPointAmount(bindingQuoteRemaining)}`}
+                            </p>
+                            {bindingQuotePreviewOptions.includeAuthorNote && !(bindingQuotePreviewOptions.authorNoteText || '').trim() && (
+                                <p className="text-negative" style={{ textAlign: 'center', fontSize: '0.82rem' }}>
+                                    작가의 말을 입력해야 제본을 진행할 수 있습니다.
+                                </p>
+                            )}
+                            {bindingOpenError && <p className="text-negative" style={{ textAlign: 'center' }}>{bindingOpenError}</p>}
+                            <div className="points-modal-actions">
+                                <button className="btn btn-outline" onClick={closeBindingQuote} disabled={bindingQuoteLoading}>취소</button>
+                                <button className="btn btn-primary" onClick={() => void confirmBindingExport()} disabled={bindingQuoteLoading || bindingQuoteEstimatedPages === 0 || (bindingQuotePreviewOptions.includeAuthorNote && !(bindingQuotePreviewOptions.authorNoteText || '').trim())}>
+                                    {bindingQuoteLoading ? '준비 중...' : '확인'}
                                 </button>
                             </div>
                         </div>
@@ -2881,6 +4360,12 @@ export default function App() {
         const pointSummary = pointDashboard?.summary;
         const pointLedger = pointDashboard?.ledger || [];
         const pointTopUsers = pointDashboard?.topUsers || [];
+        const pointLedgerPageSize = 8;
+        const pointLedgerTotalPages = Math.max(1, Math.ceil((adminPointUserDetail?.recentTransactions.length || 0) / pointLedgerPageSize));
+        const pointLedgerPage = Math.min(adminPointLedgerPage, pointLedgerTotalPages - 1);
+        const visiblePointLedger = adminPointUserDetail
+            ? adminPointUserDetail.recentTransactions.slice(pointLedgerPage * pointLedgerPageSize, (pointLedgerPage + 1) * pointLedgerPageSize)
+            : [];
         const query = adminQuery.trim().toLowerCase();
         const numberFmt = new Intl.NumberFormat('ko-KR');
         const formatCount = (value: number | null | undefined) => numberFmt.format(Number(value || 0));
@@ -3573,7 +5058,8 @@ export default function App() {
                             {[
                                 { label: '총 잔액', value: pointSummary?.totalBalance ?? 0, sub: `회원 ${pointSummary?.userCount ?? 0}명` },
                                 { label: '총 유입', value: pointSummary?.totalInflow ?? 0, sub: `충전 ${formatPointAmount(pointSummary?.totalTopup ?? 0)}` },
-                                { label: '총 유출', value: pointSummary?.totalOutflow ?? 0, sub: `대화 ${formatPointAmount(pointSummary?.chatSpent ?? 0)}` },
+                                { label: '총 유출', value: pointSummary?.totalOutflow ?? 0, sub: `대화 ${formatPointAmount(pointSummary?.chatSpent ?? 0)} · 제본 ${formatPointAmount(pointSummary?.bindingSpent ?? 0)}` },
+                                { label: '제본 차감', value: pointSummary?.bindingSpent ?? 0, sub: 'A5 제본 출력' },
                                 { label: '웰컴 지급', value: pointSummary?.welcomeGranted ?? 0, sub: '회원가입 첫 지급' },
                                 { label: '관리자 지급', value: pointSummary?.adminGranted ?? 0, sub: `회수 ${formatPointAmount(pointSummary?.adminDeducted ?? 0)}` },
                                 { label: '24시간 변동', value: pointSummary?.net24h ?? 0, sub: `최근 ${pointSummary?.transactions24h ?? 0}건` },
@@ -3606,7 +5092,7 @@ export default function App() {
                                                         </span>
                                                     </div>
                                                     <p className="text-muted points-ledger-note">
-                                                        {tx.transactionType} · {tx.note || '메모 없음'} · {tx.userEmail || '-'}
+                                                        {formatPointTransactionTypeLabel(tx.transactionType)} · {tx.note || '메모 없음'} · {tx.userEmail || '-'}
                                                     </p>
                                                 </div>
                                                 <div className="points-ledger-meta">
@@ -4195,7 +5681,7 @@ export default function App() {
                 )}
 
                 {adminPointUserDetail && (
-                    <div className="modal-overlay" onClick={() => setAdminPointUserDetail(null)}>
+                    <div className="modal-overlay" onClick={closeAdminPointUserDetail}>
                         <div className="modal-content admin-point-modal" onClick={(e) => e.stopPropagation()}>
                             <div className="admin-story-modal-header">
                                 <div>
@@ -4213,7 +5699,24 @@ export default function App() {
                                         </span>
                                     </p>
                                 </div>
-                                <button className="btn btn-outline" onClick={() => setAdminPointUserDetail(null)}>닫기</button>
+                                <div className="admin-point-header-actions">
+                                    {adminPointUserView === 'ledger' ? (
+                                        <button className="btn btn-outline" onClick={() => setAdminPointUserView('summary')}>
+                                            회원 상세로
+                                        </button>
+                                    ) : (
+                                        <button
+                                            className="btn btn-outline"
+                                            onClick={() => {
+                                                setAdminPointLedgerPage(0);
+                                                setAdminPointUserView('ledger');
+                                            }}
+                                        >
+                                            포인트 내역 조회
+                                        </button>
+                                    )}
+                                    <button className="btn btn-outline" onClick={closeAdminPointUserDetail}>닫기</button>
+                                </div>
                             </div>
 
                             <div className="admin-story-modal-badges">
@@ -4224,98 +5727,164 @@ export default function App() {
                                 </span>
                             </div>
 
-                            <div className="admin-point-grid">
-                                <div className="admin-point-panel">
-                                    <h3>회원 정보</h3>
-                                    <div className="admin-story-detail-meta">
-                                        <div><span>가입일</span><strong>{formatDateTime(adminPointUserDetail.user.createdAt)}</strong></div>
-                                        <div><span>성인 인증</span><strong>{adminPointUserDetail.user.isAdult ? '완료' : '미완료'}</strong></div>
-                                        <div><span>프리미엄</span><strong>{adminPointUserDetail.user.isPremium ? '사용 중' : '일반'}</strong></div>
-                                        <div><span>공개 권한</span><strong>{adminPointUserDetail.user.canPublishCommunity ? '허용' : '비허용'}</strong></div>
-                                    </div>
-                                    <div className="admin-point-actions">
-                                        <button
-                                            className="btn btn-outline"
-                                            onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { isPremium: !adminPointUserDetail.user.isPremium })}
-                                            disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
-                                        >
-                                            {adminPointUserDetail.user.isPremium ? '프리미엄 끄기' : '프리미엄 켜기'}
-                                        </button>
-                                        <button
-                                            className="btn btn-outline"
-                                            onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { canPublishCommunity: !adminPointUserDetail.user.canPublishCommunity })}
-                                            disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
-                                        >
-                                            {adminPointUserDetail.user.canPublishCommunity ? '공개권한 회수' : '공개권한 부여'}
-                                        </button>
-                                        <button
-                                            className="btn btn-outline is-danger"
-                                            onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { isSuspended: !adminPointUserDetail.user.isSuspended })}
-                                            disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
-                                        >
-                                            {adminPointUserDetail.user.isSuspended ? '정지 해제' : '정지'}
-                                        </button>
-                                    </div>
-                                    {adminPointUserDetail.user.role === 'admin' && (
-                                        <p className="input-help" style={{ marginTop: '0.75rem' }}>
-                                            관리자 계정은 권한 변경과 포인트 조정이 제한됩니다.
-                                        </p>
-                                    )}
-                                </div>
-
-                                <div className="admin-point-panel">
-                                    <h3>포인트 조정</h3>
-                                    <div className="input-group">
-                                        <label>변경 포인트 (+ / -)</label>
-                                        <input
-                                            className="input-control"
-                                            value={adminPointAdjustment}
-                                            onChange={(e) => setAdminPointAdjustment(e.target.value)}
-                                            placeholder="예: 100 또는 -50"
-                                            disabled={adminPointUserDetail.user.role === 'admin'}
-                                        />
-                                    </div>
-                                    <div className="input-group">
-                                        <label>사유</label>
-                                        <textarea
-                                            className="input-control"
-                                            value={adminPointAdjustmentNote}
-                                            onChange={(e) => setAdminPointAdjustmentNote(e.target.value)}
-                                            placeholder="포인트 지급/회수/수정 사유를 남겨주세요."
-                                            disabled={adminPointUserDetail.user.role === 'admin'}
-                                        />
-                                    </div>
-                                    <button
-                                        className="btn btn-primary"
-                                        style={{ width: '100%', justifyContent: 'center' }}
-                                        onClick={() => void handleAdminPointAdjustment()}
-                                        disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `point:${adminPointUserDetail.user.id}`}
-                                    >
-                                        <CircleDollarSign size={16} /> 저장하기
-                                    </button>
-                                </div>
-                            </div>
-
-                            <div className="admin-point-panel" style={{ marginTop: '1rem' }}>
-                                <h3>최근 포인트 내역</h3>
-                                <div className="admin-detail-list admin-detail-scroll">
-                                    {adminPointUserDetail.recentTransactions.map((tx) => (
-                                        <div key={tx.id} className="admin-detail-item">
-                                            <div className="admin-detail-item-head">
-                                                <strong>{tx.transactionType}</strong>
-                                                <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
-                                                    {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}
-                                                </span>
+                            {adminPointUserView === 'summary' ? (
+                                <>
+                                    <div className="admin-point-grid">
+                                        <div className="admin-point-panel">
+                                            <h3>회원 정보</h3>
+                                            <div className="admin-story-detail-meta">
+                                                <div><span>가입일</span><strong>{formatDateTime(adminPointUserDetail.user.createdAt)}</strong></div>
+                                                <div><span>휴대폰</span><strong>{adminPointUserDetail.user.phoneNumber || '미등록'}</strong></div>
+                                                <div><span>본인 인증</span><strong>{adminPointUserDetail.user.phoneVerifiedAt ? '완료' : '미완료'}</strong></div>
+                                                <div><span>성인 인증</span><strong>{adminPointUserDetail.user.isAdult ? '완료' : '미완료'}</strong></div>
+                                                <div><span>성인 인증일</span><strong>{adminPointUserDetail.user.adultVerifiedAt ? formatDateTime(adminPointUserDetail.user.adultVerifiedAt) : '-'}</strong></div>
+                                                <div><span>프리미엄</span><strong>{adminPointUserDetail.user.isPremium ? '사용 중' : '일반'}</strong></div>
+                                                <div><span>공개 권한</span><strong>{adminPointUserDetail.user.canPublishCommunity ? '허용' : '비허용'}</strong></div>
                                             </div>
-                                            <p className="text-muted admin-detail-mini">
-                                                {formatDateTime(tx.createdAt)} · 잔액 {formatPointAmount(tx.balanceAfter)}
-                                            </p>
-                                            <p className="admin-detail-text">{tx.note || '메모 없음'}</p>
+                                            <div className="admin-point-actions">
+                                                <button
+                                                    className="btn btn-outline"
+                                                    onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { isPremium: !adminPointUserDetail.user.isPremium })}
+                                                    disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
+                                                >
+                                                    {adminPointUserDetail.user.isPremium ? '프리미엄 끄기' : '프리미엄 켜기'}
+                                                </button>
+                                                <button
+                                                    className="btn btn-outline"
+                                                    onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { canPublishCommunity: !adminPointUserDetail.user.canPublishCommunity })}
+                                                    disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
+                                                >
+                                                    {adminPointUserDetail.user.canPublishCommunity ? '공개권한 회수' : '공개권한 부여'}
+                                                </button>
+                                                <button
+                                                    className="btn btn-outline is-danger"
+                                                    onClick={() => void updateAdminUserStatus(adminPointUserDetail.user.id, { isSuspended: !adminPointUserDetail.user.isSuspended })}
+                                                    disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `user:${adminPointUserDetail.user.id}`}
+                                                >
+                                                    {adminPointUserDetail.user.isSuspended ? '정지 해제' : '정지'}
+                                                </button>
+                                            </div>
+                                            {adminPointUserDetail.user.role === 'admin' && (
+                                                <p className="input-help" style={{ marginTop: '0.75rem' }}>
+                                                    관리자 계정은 권한 변경과 포인트 조정이 제한됩니다.
+                                                </p>
+                                            )}
                                         </div>
-                                    ))}
-                                    {adminPointUserDetail.recentTransactions.length === 0 && <p className="text-muted">최근 내역이 없습니다.</p>}
+
+                                        <div className="admin-point-panel">
+                                            <h3>포인트 조정</h3>
+                                            <div className="input-group">
+                                                <label>변경 포인트 (+ / -)</label>
+                                                <input
+                                                    className="input-control"
+                                                    value={adminPointAdjustment}
+                                                    onChange={(e) => setAdminPointAdjustment(e.target.value)}
+                                                    placeholder="예: 100 또는 -50"
+                                                    disabled={adminPointUserDetail.user.role === 'admin'}
+                                                />
+                                            </div>
+                                            <div className="input-group">
+                                                <label>사유</label>
+                                                <textarea
+                                                    className="input-control"
+                                                    value={adminPointAdjustmentNote}
+                                                    onChange={(e) => setAdminPointAdjustmentNote(e.target.value)}
+                                                    placeholder="포인트 지급/회수/수정 사유를 남겨주세요."
+                                                    disabled={adminPointUserDetail.user.role === 'admin'}
+                                                />
+                                            </div>
+                                            <button
+                                                className="btn btn-primary"
+                                                style={{ width: '100%', justifyContent: 'center' }}
+                                                onClick={() => void handleAdminPointAdjustment()}
+                                                disabled={adminPointUserDetail.user.role === 'admin' || adminMutation === `point:${adminPointUserDetail.user.id}`}
+                                            >
+                                                <CircleDollarSign size={16} /> 저장하기
+                                            </button>
+                                            <div style={{ marginTop: '1rem' }}>
+                                                <div className="section-title-row" style={{ marginBottom: '0.7rem' }}>
+                                                    <h3 className="section-title">최근 포인트 내역</h3>
+                                                    <span className="section-limit">최근 5건</span>
+                                                </div>
+                                                <div className="admin-detail-list">
+                                                    {adminPointUserDetail.recentTransactions.slice(0, 5).map((tx) => (
+                                                        <div key={tx.id} className="admin-detail-item">
+                                                <div className="admin-detail-item-head">
+                                                    <strong>{formatPointTransactionTypeLabel(tx.transactionType)}</strong>
+                                                    <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
+                                                        {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}
+                                                    </span>
+                                                </div>
+                                                            <p className="text-muted admin-detail-mini">
+                                                                {formatDateTime(tx.createdAt)} · 잔액 {formatPointAmount(tx.balanceAfter)}
+                                                            </p>
+                                                            <p className="admin-detail-text">{tx.note || '메모 없음'}</p>
+                                                        </div>
+                                                    ))}
+                                                    {adminPointUserDetail.recentTransactions.length === 0 && <p className="text-muted">최근 내역이 없습니다.</p>}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </>
+                            ) : (
+                                <div className="admin-point-ledger-shell">
+                                    <div className="admin-point-ledger-toolbar">
+                                        <div>
+                                            <h3>포인트 내역 조회</h3>
+                                            <p className="text-muted" style={{ marginTop: '0.25rem' }}>
+                                                스크롤 없이 페이지 단위로 확인할 수 있습니다.
+                                            </p>
+                                        </div>
+                                        <div className="admin-point-ledger-nav">
+                                            <button
+                                                className="btn btn-outline"
+                                                onClick={() => setAdminPointLedgerPage((page) => Math.max(0, page - 1))}
+                                                disabled={adminPointLedgerPage === 0}
+                                            >
+                                                이전
+                                            </button>
+                                            <span className="badge badge-gold">
+                                                {pointLedgerPage + 1} / {pointLedgerTotalPages}
+                                            </span>
+                                            <button
+                                                className="btn btn-outline"
+                                                onClick={() => setAdminPointLedgerPage((page) => Math.min(pointLedgerTotalPages - 1, page + 1))}
+                                                disabled={pointLedgerPage >= pointLedgerTotalPages - 1}
+                                            >
+                                                다음
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="admin-point-ledger-summary">
+                                        <span className="badge badge-gold">잔액 {formatPointAmount(adminPointUserDetail.user.pointBalance)}</span>
+                                        <span className="badge badge-green">{adminPointUserDetail.recentTransactions.length}건</span>
+                                    </div>
+
+                                    <div className="admin-point-ledger-grid">
+                                        {visiblePointLedger.map((tx) => (
+                                            <div key={tx.id} className="admin-point-ledger-card">
+                                            <div className="admin-point-ledger-card-head">
+                                                    <strong>{formatPointTransactionTypeLabel(tx.transactionType)}</strong>
+                                                    <span className={tx.amount >= 0 ? 'text-positive' : 'text-negative'}>
+                                                        {tx.amount >= 0 ? '+' : ''}{formatPointAmount(tx.amount)}
+                                                    </span>
+                                                </div>
+                                                <p className="text-muted admin-detail-mini">
+                                                    {formatDateTime(tx.createdAt)} · 잔액 {formatPointAmount(tx.balanceAfter)}
+                                                </p>
+                                                <p className="admin-detail-text">{tx.note || '메모 없음'}</p>
+                                                <p className="admin-point-ledger-meta">
+                                                    <span>종류 {tx.referenceType || '-'}</span>
+                                                    <span>기준 {tx.referenceId ?? '-'}</span>
+                                                </p>
+                                            </div>
+                                        ))}
+                                        {visiblePointLedger.length === 0 && <p className="text-muted">표시할 내역이 없습니다.</p>}
+                                    </div>
                                 </div>
-                            </div>
+                            )}
                         </div>
                     </div>
                 )}
@@ -4331,7 +5900,9 @@ export default function App() {
             {view === 'community' && renderCommunity()}
             {view === 'studio' && renderStudio()}
             {view === 'chat' && renderChat()}
+            {view === 'binding' && renderBinding()}
             {view === 'points' && renderPoints()}
+            {view === 'profile' && renderProfile()}
             {view === 'admin' && renderAdmin()}
         </div>
     );

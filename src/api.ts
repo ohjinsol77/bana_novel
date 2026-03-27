@@ -16,6 +16,96 @@ export async function fetchMe() {
     return res.json();
 }
 
+export async function requestPhoneVerification(data: { phoneNumber: string; purpose: 'signup' | 'identity' | 'adult' | 'topup'; createdForUserId?: number }) {
+    const res = await fetch(`${BASE}/auth/phone/request`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `인증번호 전송에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function verifyPhoneCode(data: { verificationId: number; code: string }) {
+    const res = await fetch(`${BASE}/auth/phone/verify`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `인증번호 확인에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function registerLocalUser(data: { name: string; email: string; password: string; birthDate?: string; phoneVerificationToken: string }) {
+    const res = await fetch(`${BASE}/auth/register`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `회원가입에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function loginLocalUser(data: { email: string; password: string }) {
+    const res = await fetch(`${BASE}/auth/login`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `로그인에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function completePhoneVerification(data: { verificationToken: string }) {
+    const res = await fetch(`${BASE}/auth/me/phone`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `본인인증에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function completeAdultVerification(data: { verificationToken: string; birthDate: string }) {
+    const res = await fetch(`${BASE}/auth/me/adult`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(data),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `성인인증에 실패했습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
 export async function fetchMyPoints() {
     const res = await fetch(`${BASE}/points/me`, { headers: authHeaders() });
     if (!res.ok) {
@@ -123,6 +213,21 @@ export async function fetchStoryMessages(storyId: number) {
     return res.json();
 }
 
+export async function updateStoryMessage(storyId: number, messageId: number, content: string) {
+    const res = await fetch(`${BASE}/chat/${storyId}/messages/${messageId}`, {
+        method: 'PUT',
+        headers: authHeaders(),
+        body: JSON.stringify({ content }),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `메시지를 수정할 수 없습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
 export async function sendStoryMessage(storyId: number, content: string) {
     const res = await fetch(`${BASE}/chat/${storyId}`, {
         method: 'POST', headers: authHeaders(), body: JSON.stringify({ content })
@@ -131,6 +236,42 @@ export async function sendStoryMessage(storyId: number, content: string) {
         const errData = await res.json().catch(() => ({}));
         const error = new Error(errData.error || `집필 전송 실패 (${res.status})`);
         (error as Error & { status?: number }).status = res.status;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function prepareStoryBinding(storyId: number, options?: { includeCover?: boolean; includeUserText?: boolean; includeAuthorNote?: boolean; authorNoteText?: string }) {
+    const res = await fetch(`${BASE}/stories/${storyId}/binding/prepare`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ options: options || {} }),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `제본용 페이지를 준비할 수 없습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        (error as Error & { code?: string }).code = errData.code;
+        (error as Error & { requiredPoints?: number }).requiredPoints = errData.requiredPoints;
+        (error as Error & { pointBalance?: number }).pointBalance = errData.pointBalance;
+        throw error;
+    }
+    return res.json();
+}
+
+export async function finalizeStoryBinding(storyId: number, options?: { includeCover?: boolean; includeUserText?: boolean; includeAuthorNote?: boolean; authorNoteText?: string }) {
+    const res = await fetch(`${BASE}/stories/${storyId}/binding/complete`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ options: options || {} }),
+    });
+    if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        const error = new Error(errData.error || `제본 포인트를 차감할 수 없습니다 (${res.status})`);
+        (error as Error & { status?: number }).status = res.status;
+        (error as Error & { code?: string }).code = errData.code;
+        (error as Error & { requiredPoints?: number }).requiredPoints = errData.requiredPoints;
+        (error as Error & { pointBalance?: number }).pointBalance = errData.pointBalance;
         throw error;
     }
     return res.json();
