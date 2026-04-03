@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      mysql:
+        image: mysql:8.4
+        ports:
+          - 3306:3306
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: novelai_db
+          MYSQL_USER: novel
+          MYSQL_PASSWORD: Password1!
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_USER: novel
+      DB_PASSWORD: Password1!
+      DB_NAME: novelai_db
+      PORT: 4000
+      JWT_SECRET: ci-jwt-secret
+      SESSION_SECRET: ci-session-secret
+      FRONTEND_URL: http://localhost:5174
+      PASS_DEV_MODE: 1
+      SMS_DEV_MODE: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npx vite build
+
+      - name: API smoke test
+        run: npm run api:smoke

@@ -18,6 +18,14 @@ function parseJsonField(value, fallback = null) {
     }
 }
 
+function createStoryRouteError(message, status = 400, code = null, extra = {}) {
+    const error = new Error(message);
+    error.status = status;
+    error.code = code;
+    Object.assign(error, extra);
+    return error;
+}
+
 function normalizePublicStatus(value) {
     return ['private', 'pending', 'approved', 'rejected'].includes(value) ? value : 'private';
 }
@@ -377,6 +385,38 @@ router.get('/', auth, async (req, res) => {
     }
 });
 
+router.get('/community', auth, async (req, res) => {
+    try {
+        const [rows] = await pool.query(`
+            SELECT
+                s.id,
+                s.title,
+                s.background,
+                s.environment,
+                s.cover_image_url AS coverImageUrl,
+                s.public_status AS publicStatus,
+                s.public_method AS publicMethod,
+                s.is_public AS isPublic,
+                s.updated_at AS updatedAt,
+                s.created_at AS createdAt,
+                u.name AS authorName,
+                u.role AS authorRole
+            FROM stories s
+            LEFT JOIN users u ON u.id = s.user_id
+            WHERE s.is_public = 1
+              AND s.public_status = 'approved'
+              AND s.user_id <> ?
+            ORDER BY s.updated_at DESC, s.id DESC
+            LIMIT 100
+        `, [req.user.id]);
+
+        res.json(rows);
+    } catch (err) {
+        console.error('Error fetching community stories:', err);
+        res.status(500).json({ error: '커뮤니티 목록을 불러올 수 없습니다.' });
+    }
+});
+
 // ── 단일 이야기 상세 조회 ───────────────────────────────────
 router.get('/:id', auth, async (req, res) => {
     try {
@@ -403,8 +443,8 @@ router.post('/', auth, async (req, res) => {
 
         const { title, background, environment, cover_image_url, characters } = req.body;
 
-        if (!title) throw new Error('이야기 제목은 필수입니다.');
-        if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
+        if (!String(title || '').trim()) throw createStoryRouteError('이야기 제목은 필수입니다.');
+        if (characters && characters.length > 7) throw createStoryRouteError('등장인물은 최대 7명까지만 가능합니다.');
 
         const [countRows] = await conn.query('SELECT COUNT(*) AS storyCount FROM stories WHERE user_id=?', [req.user.id]);
         const storyCount = Number(countRows[0]?.storyCount || 0);
@@ -447,7 +487,7 @@ router.post('/', auth, async (req, res) => {
         if (characters && characters.length > 0) {
             for (const char of characters) {
                 const { name, personaJson } = serializeCharacterPayload(char);
-                if (!name) throw new Error('등장인물의 이름이 누락되었습니다.');
+                if (!name) throw createStoryRouteError('등장인물의 이름이 누락되었습니다.');
                 await conn.query(
                     `INSERT INTO story_characters (story_id, name, persona_json)
                      VALUES (?, ?, ?)`,
@@ -494,8 +534,9 @@ router.put('/:id', auth, async (req, res) => {
 
         // 본인 소유 확인
         const [check] = await conn.query('SELECT id, public_status, public_method, public_requested_at, public_reviewed_at, public_reviewed_by, public_review_message, cover_image_url FROM stories WHERE id=? AND user_id=?', [storyId, req.user.id]);
-        if (!check.length) throw new Error('권한이 없거나 이야기를 찾을 수 없습니다.');
-        if (characters && characters.length > 7) throw new Error('등장인물은 최대 7명까지만 가능합니다.');
+        if (!check.length) throw createStoryRouteError('권한이 없거나 이야기를 찾을 수 없습니다.', 404);
+        if (!String(title || '').trim()) throw createStoryRouteError('이야기 제목은 필수입니다.');
+        if (characters && characters.length > 7) throw createStoryRouteError('등장인물은 최대 7명까지만 가능합니다.');
         const currentStory = check[0];
         const publicState = resolvePublicStoryState(currentStory, public_method, Boolean(is_public), req.user);
         const nextCoverImageUrl = typeof cover_image_url === 'string'
@@ -530,7 +571,7 @@ router.put('/:id', auth, async (req, res) => {
         if (characters && characters.length > 0) {
             for (const char of characters) {
                 const { name, personaJson } = serializeCharacterPayload(char);
-                if (!name) throw new Error('등장인물의 이름이 누락되었습니다.');
+                if (!name) throw createStoryRouteError('등장인물의 이름이 누락되었습니다.');
                 await conn.query(
                     `INSERT INTO story_characters (story_id, name, persona_json)
                      VALUES (?, ?, ?)`,
@@ -557,43 +598,14 @@ router.put('/:id', auth, async (req, res) => {
     }
 });
 
-router.get('/community', auth, async (req, res) => {
-    try {
-        const [rows] = await pool.query(`
-            SELECT
-                s.id,
-                s.title,
-                s.background,
-                s.environment,
-                s.cover_image_url AS coverImageUrl,
-                s.public_status AS publicStatus,
-                s.public_method AS publicMethod,
-                s.is_public AS isPublic,
-                s.updated_at AS updatedAt,
-                s.created_at AS createdAt,
-                u.name AS authorName,
-                u.role AS authorRole
-            FROM stories s
-            LEFT JOIN users u ON u.id = s.user_id
-            WHERE s.is_public = 1
-              AND s.public_status = 'approved'
-              AND s.user_id <> ?
-            ORDER BY s.updated_at DESC, s.id DESC
-            LIMIT 100
-        `, [req.user.id]);
-
-        res.json(rows);
-    } catch (err) {
-        console.error('Error fetching community stories:', err);
-        res.status(500).json({ error: '커뮤니티 목록을 불러올 수 없습니다.' });
-    }
-});
-
 // ── 이야기 삭제 ─────────────────────────────────────────────
 router.delete('/:id', auth, async (req, res) => {
     try {
         // ON DELETE CASCADE 설정이 되어있으므로 stories만 지우면 캐릭터와 메시지도 날아감
-        await pool.query('DELETE FROM stories WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
+        const [result] = await pool.query('DELETE FROM stories WHERE id=? AND user_id=?', [req.params.id, req.user.id]);
+        if (!result.affectedRows) {
+            return res.status(404).json({ error: '이야기를 찾을 수 없습니다.' });
+        }
         res.json({ ok: true });
     } catch (err) {
         console.error('Error deleting story:', err);

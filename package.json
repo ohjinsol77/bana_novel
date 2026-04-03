@@ -7,6 +7,7 @@
     "dev": "concurrently \"vite\" \"node server/index.js\"",
     "server": "node server/index.js",
     "seed:demo": "node server/seed-demo-data.js",
+    "api:smoke": "node scripts/api-smoke-test.mjs",
     "build": "tsc && vite build",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
     "preview": "vite preview"
